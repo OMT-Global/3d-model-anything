@@ -42,7 +42,7 @@ enum ScanImport {
       exported.house = id; exported.houseName = house.name
       exported.session = sessionID; exported.zone = zone.id; exported.alignment = .init(method: exported.captureMode == .outdoor ? "unaligned" : "first")
       try bundle.writeManifest(exported)
-      house.beginSession(id: sessionID, zone: zone.id, alignment: exported.alignment!, at: room.capturedAt)
+      house.beginSession(id: sessionID, zone: zone.id, alignment: exported.alignment!, at: room.capturedAt, captureMode: exported.captureMode ?? room.captureMode)
       house.recordRoomScan(name: room.name, session: sessionID, index: room.index, capturedAt: room.capturedAt, matchName: false)
       house.endSession(sessionID)
     }

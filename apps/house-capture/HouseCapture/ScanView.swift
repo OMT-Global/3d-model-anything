@@ -337,7 +337,7 @@ final class DepthRecorder: @unchecked Sendable {
 
   /// Call every frame; keeps one when the camera has moved or turned enough (≤ 5/s)
   func consider(_ frame: ARFrame, room: Int, camera: CameraState?, interval: TimeInterval = 0.2) {
-    guard let depth = frame.sceneDepth, inFlight < 3 else { return }
+    guard let depth = frame.sceneDepth, let confidence = depth.confidenceMap, inFlight < 3 else { return }
     guard case .normal = frame.camera.trackingState else { return }
     let pose = frame.camera.transform
     if let last {
@@ -363,7 +363,7 @@ final class DepthRecorder: @unchecked Sendable {
       rgbIntrinsics: kc.columnMajor, camera: camera, room: room, timestamp: frame.timestamp,
       width: w, height: h, transform: pose.columnMajor, intrinsics: k.columnMajor)
     let depthData = Self.float16(depth.depthMap)
-    guard let confData = depth.confidenceMap.map(Self.bytes) else { return }
+    let confData = Self.bytes(confidence)
     inFlight += 1
     queue.async {
       let failure: String?

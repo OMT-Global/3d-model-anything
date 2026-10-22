@@ -23,7 +23,7 @@ struct FieldworkRoomScreen: View {
       if let house, let room {
         VStack(alignment: .leading, spacing: 22) {
           VStack(alignment: .leading, spacing: 10) {
-            FieldworkEyebrow(text: room.active.flatMap { manifests[$0.session]?.captureMode } == .outdoor ? "Saved outdoor capture" : "Saved room")
+            FieldworkEyebrow(text: house.captureMode(for: room) == .outdoor ? "Saved outdoor capture" : "Saved room")
             Text(room.name).font(.largeTitle.weight(.bold)).tracking(-1)
             if let active = room.active {
               Text("SCANNED " + active.capturedAt.formatted(date: .abbreviated, time: .shortened).uppercased())
@@ -42,9 +42,9 @@ struct FieldworkRoomScreen: View {
             }
             VStack(spacing: 10) {
               Button { share(house.bundle(for: session), active.index, room.name) } label: {
-                Label(busy ? "Preparing…" : (manifests[active.session]?.captureMode == .outdoor ? "Share outdoor capture" : "Share room"), systemImage: "square.and.arrow.up")
+                Label(busy ? "Preparing…" : (house.captureMode(for: room) == .outdoor ? "Share outdoor capture" : "Share room"), systemImage: "square.and.arrow.up")
               }.buttonStyle(FieldworkButtonStyle()).disabled(busy)
-              if manifests[active.session]?.captureMode != .outdoor {
+              if house.captureMode(for: room) != .outdoor {
               Button { onCapture(house.id, room.zone, nil, room.id) } label: {
                 Label("Continue scanning", systemImage: "viewfinder")
               }.buttonStyle(FieldworkButtonStyle(filled: false)).disabled(!CaptureController.isSupported || busy)
@@ -68,7 +68,7 @@ struct FieldworkRoomScreen: View {
               } icon: { Image(systemName: "clock").foregroundStyle(Fieldwork.secondary).frame(width: 28) }
             }.padding(.vertical, 4)
             FieldworkRule()
-            if manifests[active.session]?.captureMode != .outdoor {
+            if house.captureMode(for: room) != .outdoor {
             NavigationLink {
               RoomConnection(house: house, source: room, onSave: reload)
             } label: { actionRow("Connect room", subtitle: "Match a doorway with another scan", icon: "link") }

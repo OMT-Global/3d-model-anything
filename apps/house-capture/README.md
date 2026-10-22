@@ -193,7 +193,8 @@ The guidance samples finite depth within 5 m at medium/high confidence; the 20% 
 warning heuristic, not calibrated accuracy or area completeness. Sun, reflective glass, distant
 surfaces, vegetation and weak texture can cause missing geometry or drift. Automatic posed photos
 continue with overlapping views even when LiDAR is weak, including downward views of ground.
-Depth/confidence/RGB recordings keep the existing formats. Stop waits for accepted photo and depth
+Depth/confidence/RGB recordings keep the existing formats. Frames without confidence data are
+rejected before sampling state or pixel processing changes. Stop waits for accepted photo and depth
 writes; failed depth sets are omitted from the index and reported. Photos and depth can be useful
 when no mesh was captured, but the 3D preview can then be empty.
 
@@ -202,7 +203,10 @@ The bundle remains `house-capture/5` with optional `captureMode: "outdoor"` and 
 `file` and `usdz` are empty and there is no fabricated RoomPlan layout or structure. The existing
 `room` index in photos/depth refers to that capture entry. Mesh, sensor pixels, poses, intrinsics,
 confidence and depth are raw evidence for later reconstruction on a Mac. Existing indoor bundles
-omit these optional fields and need no migration. Room/session export, whole-house sharing and
+omit these optional fields and need no migration. New house session entries also retain optional
+capture mode; earlier outdoor sessions recover it from their manifest when loaded. Indoor rescan
+lists and selection reject identities with any outdoor history, even if an older mixed history has
+an indoor active version. Rejected cross-mode updates preserve the existing scan history. Room/session export, whole-house sharing and
 extracted-folder import retain outdoor metadata. Whole-house import is still unsupported.
 
 Each outdoor capture is unaligned, including after import, and starts in an independent local
@@ -223,7 +227,9 @@ sensor quality, thermal behavior or outdoor tracking. No physical-device install
 3. Pan too fast, cover the camera, then return to the same textured view. Confirm tracking pauses
    evidence and resumes only after stable tracking; save while tracking is lost. If ARKit fails,
    confirm saving remains possible and a new patch starts with a new frame.
-4. Pause, background/foreground, resume, and Stop immediately after taking a photo. Verify no late
+4. Pause, background/foreground, then explicitly tap Resume. Open Control Center during outdoor
+   capture, dismiss it, and confirm recording stays paused until Resume; verify tracking recovery
+   alone does not undo this user/lifecycle pause. Stop immediately after taking a photo. Verify no late
    writes are missing from exported indexes. Cancel a different patch and confirm earlier scans remain.
 5. Exercise low storage and a long warm-device capture. Confirm preflight/pause warnings, reduced
    capture load, visible write failures and retryable index-save errors without losing prior scans.

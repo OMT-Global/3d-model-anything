@@ -213,8 +213,7 @@ struct HomeView: View {
         try await CaptureReadiness.prepare()
         capture = try CaptureController.start(houseID: houseID, zoneID: zoneID, newZone: newZone)
         if let roomID, let room = try HouseProject.load(id: houseID).rooms.first(where: { $0.id == roomID }) {
-          capture?.selectedRoomID = room.id
-          capture?.roomName = room.name
+          capture?.selectRoom(room)
         }
       } catch { self.error = error.localizedDescription }
     }

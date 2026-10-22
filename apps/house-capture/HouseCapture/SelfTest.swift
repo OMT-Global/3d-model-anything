@@ -121,6 +121,7 @@ final class SelfTest {
     let importedID = try ScanImport.importFolder(folder)
     defer { try? fm.removeItem(at: HouseProject.url(forHouse: importedID)) }
     let imported = try HouseProject.load(id: importedID)
+    expect(imported.sessions.first?.captureMode == .outdoor, "outdoor import retains house session capture mode")
     expect(imported.sessions.first?.alignment.method == "unaligned" && imported.zones.first?.aligned == false, "outdoor import does not invent house alignment")
     expect(imported.bundle(for: imported.sessions[0]).photos.count == exported.photos.count, "outdoor import preserves posed photo evidence")
     let zip = try exported.zipped()
@@ -135,6 +136,63 @@ final class SelfTest {
     expect(try HouseProject.load(id: house.id).sessions.count == 1, "cancel outdoor preserves earlier saved session")
   }
 
+  private func outdoorRescanIsolation() throws {
+    let fm = FileManager.default
+    var house = HouseProject(id: "rescan-mode-test-" + UUID().uuidString, name: "Mode test", createdAt: Date())
+    try fm.createDirectory(at: house.url, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: house.url) }
+    let zone = house.addZone(named: "Test")
+    house.beginSession(id: "outdoor", zone: zone.id, alignment: .init(method: "unaligned"))
+    let outdoor = house.recordRoomScan(name: "Front wall", session: "outdoor", index: 0, capturedAt: Date())!
+    house.beginSession(id: "legacy-indoor", zone: zone.id, alignment: .init(method: "first"))
+    let indoor = house.recordRoomScan(name: "Office", session: "legacy-indoor", index: 0, capturedAt: Date())!
+    try house.save()
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    let legacy = try decoder.decode(HouseProject.self, from: Data(contentsOf: house.url.appendingPathComponent("house.json")))
+    expect(legacy.sessions.allSatisfy { $0.captureMode == nil }, "legacy house sessions decode without captureMode")
+    let bundle = try ScanBundle.create(in: house, id: "outdoor")
+    try bundle.writeManifest(Manifest(createdAt: Date(), device: "synthetic", systemVersion: "0", house: house.id, session: "outdoor", zone: zone.id,
+                                      rooms: [], photos: "photos/photos.json", photoCount: 0, captureMode: .outdoor))
+    house = try HouseProject.load(id: house.id)
+    expect(house.session("outdoor")?.captureMode == .outdoor, "legacy outdoor mode is recovered from its manifest")
+    expect(house.captureMode(for: indoor) == .indoor, "legacy indoor records remain eligible without mode metadata")
+    try house.save()
+    let reloaded = try decoder.decode(HouseProject.self, from: Data(contentsOf: house.url.appendingPathComponent("house.json")))
+    expect(reloaded.session("outdoor")?.captureMode == .outdoor, "optional session mode round-trips in house.json")
+
+    let capture = try CaptureController.start(houseID: house.id, zoneID: nil)
+    defer { capture.abandon() }
+    expect(capture.existingRooms.map(\.id) == [indoor.id] && capture.existingRoomNames == ["Office"], "indoor rescan lists exclude outdoor captures")
+    capture.selectRoom(outdoor)
+    expect(capture.selectedRoomID == nil && capture.roomName.isEmpty, "direct outdoor selection is rejected")
+    capture.selectRoom(indoor)
+    expect(capture.selectedRoomID == indoor.id && capture.canStartRoom, "legacy indoor selection still starts a rescan")
+    capture.selectedRoomID = outdoor.id
+    expect(!capture.canStartRoom, "start guard rejects bypassed or stale outdoor selection")
+
+    house = try HouseProject.load(id: house.id)
+    let before = house.rooms.first { $0.id == outdoor.id }!
+    let rejected = house.recordRoomScan(name: "Front wall", session: capture.plan.sessionID, index: 1, capturedAt: Date(), roomID: outdoor.id)
+    expect(rejected == nil && house.session(capture.plan.sessionID)?.rooms.isEmpty == true, "storage rejects cross-mode rescan before indexing it")
+    let after = house.rooms.first { $0.id == outdoor.id }!
+    expect(after.history == before.history && after.active == before.active && after.zone == before.zone, "rejected indoor rescan preserves outdoor history and active version")
+    let sameName = house.recordRoomScan(name: "Front wall", session: capture.plan.sessionID, index: 2, capturedAt: Date())!
+    expect(sameName.id != outdoor.id && house.rooms.first { $0.id == outdoor.id }?.history == before.history, "name matching cannot merge indoor and outdoor histories")
+
+    // Preserve and conservatively classify a mixed history written by an earlier app.
+    let ri = house.rooms.firstIndex { $0.id == outdoor.id }!
+    let oldIndoorRef = HouseProject.RoomRef(session: "legacy-indoor", index: 1, capturedAt: Date())
+    house.rooms[ri].history.append(oldIndoorRef)
+    house.rooms[ri].active = oldIndoorRef
+    try house.save()
+    let mixed = try HouseProject.load(id: house.id)
+    expect(mixed.captureMode(for: mixed.rooms[ri]) == .outdoor && mixed.rooms[ri].history.count == 2, "indoor active version cannot hide or erase earlier outdoor history")
+    let next = try CaptureController.start(houseID: house.id, zoneID: nil)
+    expect(!next.existingRooms.contains { $0.id == outdoor.id }, "mixed historical identity stays out of indoor rescan list")
+    next.abandon()
+  }
+
   func run() async -> Bool {
     var houseID: String?
     do {
@@ -142,6 +200,7 @@ final class SelfTest {
       trackingRecovery()
       try roomExperience()
       try await outdoorCapture()
+      try outdoorRescanIsolation()
       try captureDiagnostics()
       try await previewNormals()
       try await photoTextures()

@@ -249,7 +249,7 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
     var zone: HouseProject.Zone?
     if mode == .outdoor {
       zone = house.addZone(named: "Outdoor capture")
-      if let i = house.zones.indices.last { house.zones[i].aligned = false }
+      if let i = house.zones.firstIndex(where: { $0.id == zone?.id }) { house.zones[i].aligned = false }
     } else if let newZone {
       zone = house.addZone(named: newZone)
     } else if let zoneID {
@@ -290,7 +290,7 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
     }
     let bundle = try ScanBundle.create(in: house, id: id)
     do {
-      house.beginSession(id: id, zone: zone.id, alignment: alignment)
+      house.beginSession(id: id, zone: zone.id, alignment: alignment, captureMode: mode)
       try house.save()
     } catch {
       try? bundle.delete()
@@ -307,9 +307,7 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
 
   /// Rooms of this zone scanned in earlier sessions (and not yet in this one): rescan candidates
   var existingRoomNames: [String] {
-    house.rooms
-      .filter { r in !r.history.contains { $0.session == plan.sessionID } }
-      .map(\.name)
+    existingRooms.map(\.name)
   }
 
   /// Call when the capture screen appears
@@ -669,12 +667,21 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
   var requiresFreshScan: Bool { warnedBigMap || rooms.count >= 4 }
 
   var selectedRoomID: String?
-  var existingRooms: [HouseProject.Room] { house.rooms.filter { r in !r.history.contains { $0.session == plan.sessionID } } }
-  func selectRoom(_ room: HouseProject.Room) {
-    roomName = room.name
-    selectedRoomID = room.id
+  var existingRooms: [HouseProject.Room] {
+    guard !isOutdoor else { return [] }
+    return house.rooms.filter { r in
+      house.captureMode(for: r) == .indoor && !r.history.contains { $0.session == plan.sessionID }
+    }
   }
-  var canStartRoom: Bool { (!isOutdoor || rooms.isEmpty) && phase == .betweenRooms && !sessionNeedsRestart && !recordingSaveFailed && !requiresFreshScan && !roomName.trimmingCharacters(in: .whitespaces).isEmpty }
+  func selectRoom(_ room: HouseProject.Room) {
+    guard let candidate = existingRooms.first(where: { $0.id == room.id }) else { return }
+    roomName = candidate.name
+    selectedRoomID = candidate.id
+  }
+  private var validRoomSelection: Bool {
+    selectedRoomID == nil || existingRooms.contains { $0.id == selectedRoomID }
+  }
+  var canStartRoom: Bool { validRoomSelection && (!isOutdoor || rooms.isEmpty) && phase == .betweenRooms && !sessionNeedsRestart && !recordingSaveFailed && !requiresFreshScan && !roomName.trimmingCharacters(in: .whitespaces).isEmpty }
 
   func startRoom() {
     guard canStartRoom else { return }
@@ -866,7 +873,9 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
     }
     do {
       house = try HouseProject.modify(house.id) {
-        $0.recordRoomScan(name: record.name, session: plan.sessionID, index: index, capturedAt: capturedAt, roomID: selectedRoomID, matchName: false)
+        guard $0.recordRoomScan(name: record.name, session: plan.sessionID, index: index, capturedAt: capturedAt, roomID: selectedRoomID, matchName: false) != nil else {
+          throw CaptureReadinessError(message: "This scan cannot replace a capture of another type. Its recording files are kept in the session folder.")
+        }
       }
     } catch {
       recordingSaveFailed = true
@@ -938,7 +947,9 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
       try writeManifest()
       house = try HouseProject.modify(house.id) {
         for room in rooms where !$0.rooms.contains(where: { r in r.history.contains { $0.session == plan.sessionID && $0.index == room.index } }) {
-          $0.recordRoomScan(name: room.name, session: plan.sessionID, index: room.index, capturedAt: room.capturedAt, roomID: pendingRoomIDs[room.index], matchName: false)
+          guard $0.recordRoomScan(name: room.name, session: plan.sessionID, index: room.index, capturedAt: room.capturedAt, roomID: pendingRoomIDs[room.index], matchName: false) != nil else {
+            throw CaptureReadinessError(message: "This scan cannot replace a capture of another type. Its recording files are kept in the session folder.")
+          }
         }
         $0.setAlignment(session: plan.sessionID, alignment)
         $0.endSession(plan.sessionID, at: endedAt ?? Date())
@@ -1365,7 +1376,10 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
     if frame.timestamp - lastMeshCheck > 0.5 {
       lastMeshCheck = frame.timestamp
       ensureMeshAndDepth()
-      if isOutdoor { outdoorDepthMessage = OutdoorDepthQuality.message(for: frame.sceneDepth) }
+      if isOutdoor {
+        let message = OutdoorDepthQuality.message(for: frame.sceneDepth)
+        if outdoorDepthMessage != message { outdoorDepthMessage = message }
+      }
     }
     if !isOutdoor, !cameraControl.whiteBalanceLocked, let t = meshReadyAt, now - t > 3 {
       cameraControl.lockWhiteBalance()
