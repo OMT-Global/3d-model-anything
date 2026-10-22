@@ -185,6 +185,19 @@ async function loadRoom(id: string, updated?: RoomModule) {
   referenceEpoch++;
   room = next;
   activeRoomId = mod.id;
+  let previewNote = document.querySelector<HTMLElement>('#scan-preview-note');
+  if (!previewNote) {
+    previewNote = document.createElement('p');
+    previewNote.id = 'scan-preview-note';
+    previewNote.style.cssText = 'margin:12px 16px;padding:12px;border:1px solid #647868;border-radius:8px;font-size:12px;line-height:1.5;color:#dce6d8';
+    hud.prepend(previewNote);
+  }
+  previewNote.textContent = next.previewNote ?? '';
+  previewNote.hidden = !next.previewNote;
+  hud.querySelector<HTMLButtonElement>('[data-source=model]')!.textContent = next.previewNote ? 'Raw scan' : 'Rebuilt';
+  for (const selector of ['[data-mode=knolling]', '[data-mode=walk]', '.play-link']) {
+    hud.querySelector<HTMLButtonElement>(selector)!.disabled = Boolean(next.previewNote);
+  }
   transition = undefined;
   movingRatio = Math.min(window.devicePixelRatio, 1);
   slowFrames = fastFrames = 0;

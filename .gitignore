@@ -15,3 +15,6 @@ data/scans/
 apps/house-capture/release/screenshots/
 
 HouseCapture.xcodeproj/
+
+# Private local scan previews
+data/web-assets/local-scans/
