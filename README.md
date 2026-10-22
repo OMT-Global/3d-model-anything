@@ -28,6 +28,20 @@ npm run preview
 
 The demo includes the reconstructed office and selected textures. Original scans and photo collections are not distributed; Scan and Overlay are disabled for this example. Those modes remain available for your own rooms with reference assets.
 
+## Private local scan previews
+
+The development viewer can load an ignored `data/scans/local-preview/manifest.json` array.
+Each entry has `id`, `label`, `mesh`, `measurements`, and `note` strings; asset URLs can point
+into ignored `data/web-assets/local-scans/`. Prepare room-local geometry with the bundled
+scan-to-threejs scripts. Preview rooms remain separate and disable walking, knolling, and
+playground physics. The office remains the default for missing or unknown room IDs.
+
+Production builds never read the local manifest and emit only the public assets whose hashes
+are recorded in `docs/public-assets.json`. Unreviewed files in the development public directory
+are not copied. This boundary is tested by `npm run test:local-previews` with synthetic private
+canaries and a malformed local manifest. Keep originals and subsequent captures in distinct
+ignored directories; do not force-add private files or deploy the development server.
+
 ## Capture your own space
 
 See [the iPhone app](apps/house-capture/README.md) for building with Xcode, device requirements, scanning and sharing. Scanning needs a LiDAR-equipped iPhone or iPad. Non-LiDAR devices can import and review scans.

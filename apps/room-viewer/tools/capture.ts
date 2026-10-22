@@ -15,11 +15,12 @@ if (import.meta.hot) import.meta.hot.accept('../../../demos/index', () => {});
 
 const params = new URLSearchParams(location.search);
 const view = params.get('view') ?? 'top';
-const src = params.get('src') ?? 'scan';
+let src = params.get('src') ?? 'scan';
 const ppm = Number(params.get('ppm') ?? 200);
 const pad = 0.25;
 
 const room = await roomById(params.get('room')).build();
+if (room.referenceAvailable === false && src === 'scan') src = 'model';
 
 // room bounds from its walls
 const bb = new THREE.Box2();
@@ -36,6 +37,13 @@ interface ViewDef {
   h: [Axis, number, number, number]; // axis, min, max, sign (screen right = +sign)
   v: [Axis, number, number, number]; // axis, min, max, sign (screen up = +sign)
   cut: number;
+}
+if (bb.isEmpty()) {
+  const bounds = new THREE.Box3().setFromObject(room.group);
+  if (!bounds.isEmpty()) {
+    bb.expandByPoint(new THREE.Vector2(bounds.min.x, bounds.min.z));
+    bb.expandByPoint(new THREE.Vector2(bounds.max.x, bounds.max.z));
+  } else { bb.expandByPoint(new THREE.Vector2(-1, -1)); bb.expandByPoint(new THREE.Vector2(1, 1)); }
 }
 const X: [number, number] = [bb.min.x - pad, bb.max.x + pad];
 const Z: [number, number] = [bb.min.y - pad, bb.max.y + pad];

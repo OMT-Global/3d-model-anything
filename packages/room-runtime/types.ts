@@ -74,6 +74,8 @@ export interface PhotoPose {
 }
 
 export interface RoomModule {
+  /** Local scan previews do not support authored-room interaction or physics. */
+  previewOnly?: boolean;
   id: string;
   label: string;
   build(): Promise<BuiltRoom>;
