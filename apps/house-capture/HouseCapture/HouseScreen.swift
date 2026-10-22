@@ -14,6 +14,7 @@ struct HouseScreen: View {
   let generation: Int
   let onCapture: (_ houseID: String, _ zoneID: String?, _ newZone: String?, _ roomID: String?) -> Void
   let onGone: () -> Void
+  var onOutdoorCapture: ((String) -> Void)? = nil
 
   @Environment(\.dynamicTypeSize) private var typeSize
   @State private var house: HouseProject?
@@ -163,9 +164,16 @@ struct HouseScreen: View {
       }.padding(.horizontal, 24).padding(.bottom, 20)
     }
     .safeAreaInset(edge: .bottom) {
+      VStack(spacing: 10) {
+        if let onOutdoorCapture {
+          Button { onOutdoorCapture(house.id) } label: {
+            Label("Capture outdoors", systemImage: "sun.max")
+          }.buttonStyle(FieldworkButtonStyle(filled: false)).disabled(!OutdoorCaptureCapabilities.isSupported)
+        }
       Button { onCapture(house.id, nil, nil, nil) } label: {
         Label("Scan a room", systemImage: "viewfinder")
       }.buttonStyle(FieldworkButtonStyle()).disabled(!CaptureController.isSupported)
+      }
         .padding(.horizontal, 24).padding(.top, 12).padding(.bottom, 10).background(Fieldwork.paper)
     }
   }

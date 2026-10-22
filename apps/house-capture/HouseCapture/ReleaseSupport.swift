@@ -20,8 +20,8 @@ enum CaptureReadiness {
       throw CaptureReadinessError(message: "Not enough storage. Free at least \(ByteCountFormatter.string(fromByteCount: required, countStyle: .file)) on this device, then try again. Saved scans are kept.")
     }
   }
-  @MainActor static func prepare() async throws {
-    guard CaptureController.isSupported else {
+  @MainActor static func prepare(mode: CaptureMode = .indoor) async throws {
+    guard mode == .outdoor ? OutdoorCaptureCapabilities.isSupported : CaptureController.isSupported else {
       throw CaptureReadinessError(message: "Scanning needs a LiDAR-equipped iPhone Pro or iPad Pro. You can import, view and share existing scans on this device.")
     }
     switch AVCaptureDevice.authorizationStatus(for: .video) {

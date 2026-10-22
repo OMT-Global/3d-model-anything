@@ -46,6 +46,8 @@ struct HouseProject: Codable, Identifiable {
     var alignment: Alignment
     /// RoomRecord indices captured in this session
     var rooms: [Int] = []
+    /// Optional for older house-project/1 files; missing metadata is resolved from the bundle.
+    var captureMode: CaptureMode?
     var folder: String { "sessions/\(id)" }
   }
 
@@ -107,7 +109,17 @@ extension HouseProject {
   static func load(url: URL) throws -> HouseProject {
     let decoder = JSONDecoder()
     decoder.dateDecodingStrategy = .iso8601
-    return try decoder.decode(HouseProject.self, from: Data(contentsOf: url.appendingPathComponent("house.json")))
+    var house = try decoder.decode(HouseProject.self, from: Data(contentsOf: url.appendingPathComponent("house.json")))
+    // Early outdoor exports recorded mode only in manifest.json. Hydrate once per load,
+    // so selection and history checks never mistake them for legacy indoor scans.
+    for i in house.sessions.indices where house.sessions[i].captureMode == nil {
+      let bundle = ScanBundle(url: url.appendingPathComponent(house.sessions[i].folder))
+      if let manifest = bundle.manifest {
+        house.sessions[i].captureMode = manifest.captureMode ??
+          (manifest.rooms.contains { $0.captureMode == .outdoor } ? .outdoor : .indoor)
+      }
+    }
+    return house
   }
 
   func save() throws {

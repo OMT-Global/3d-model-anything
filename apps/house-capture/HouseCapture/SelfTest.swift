@@ -78,12 +78,129 @@ final class SelfTest {
     expect(h.rooms.first { $0.id == original.id }?.active?.index == 0 && h.deletedRooms.count == 1, "deleting active version restores previous version and remains recoverable")
   }
 
+  private func outdoorCapture() async throws {
+    let fm = FileManager.default
+    let house = HouseProject(id: "outdoor-test-" + UUID().uuidString, name: "Outdoor test", createdAt: Date())
+    try fm.createDirectory(at: house.url, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: house.url) }
+    try house.save()
+    let capture = try CaptureController.start(houseID: house.id, zoneID: nil, mode: .outdoor)
+    expect(capture.isOutdoor && !capture.hasRoomPlanSession, "outdoor setup never instantiates RoomCaptureSession")
+    expect(capture.plan.worldMap == nil && capture.alignment.method == "unaligned", "outdoor starts in an independent local frame")
+    let saved = try HouseProject.load(id: house.id)
+    expect(saved.zones.allSatisfy { !$0.aligned }, "outdoor is not placed in the house even when captured first")
+    capture.roomName = "Front wall"
+    capture.finishRoom() // Cannot finalize twice or before a capture begins.
+    expect(capture.phase == .betweenRooms && capture.rooms.isEmpty, "stop outside scanning cannot create a phantom capture")
+    capture.pause()
+    expect(!capture.paused, "pause outside scanning does not change capture state")
+    await capture.finishSession()
+    expect(capture.phase == .done && !capture.hasRoomPlanSession, "outdoor save completes without a RoomPlan session")
+    expect(capture.bundle.manifest?.captureMode == .outdoor && capture.bundle.manifest?.outdoor?.source == "ARWorldTrackingConfiguration", "outdoor manifest records mode and source")
+    expect(capture.bundle.manifest?.worldMap == nil && capture.bundle.manifest?.structure == nil, "outdoor save contains no indoor structure or continuation map")
+    expect(OutdoorDepthQuality.message(usable: 0, sampled: 0).contains("unavailable"), "missing depth has actionable guidance")
+    expect(OutdoorDepthQuality.message(usable: 1, sampled: 100).contains("Weak"), "low-confidence depth does not imply a complete scan")
+    expect(OutdoorDepthQuality.message(usable: 50, sampled: 100).contains("Nearby"), "useful depth guidance stays local")
+    let config = OutdoorCaptureCapabilities.configuration()
+    expect(config.initialWorldMap == nil && config.planeDetection.isEmpty && config.frameSemantics.contains(.sceneDepth), "outdoor configuration uses depth without indoor map or plane flattening")
+
+    // A synthetic mesh-only outdoor record round-trips through the existing selective exporter.
+    try writeTestPLY(to: capture.bundle.file("mesh/room-0.ply"))
+    try writeTestPhotos(capture.bundle)
+    var manifest = capture.bundle.manifest!
+    manifest.rooms = [RoomRecord(index: 0, name: "Front wall", file: "", usdz: "", capturedAt: Date(), walls: 0, doors: 0, windows: 0, openings: 0, objects: 0,
+                                mesh: MeshRecord(file: "mesh/room-0.ply", anchors: 0, vertices: 8, faces: 4), captureMode: .outdoor)]
+    manifest.photoCount = capture.bundle.photos.count
+    try capture.bundle.writeManifest(manifest)
+    let folder = fm.temporaryDirectory.appendingPathComponent("outdoor-export-" + UUID().uuidString)
+    defer { try? fm.removeItem(at: folder) }
+    try capture.bundle.exportRoom(index: 0, name: "Front wall", to: folder)
+    let exported = ScanBundle(url: folder)
+    expect(exported.manifest?.captureMode == .outdoor && exported.manifest?.rooms.first?.captureMode == .outdoor, "selective export preserves outdoor metadata")
+    expect(exported.manifest?.rooms.first?.file == "" && fm.fileExists(atPath: exported.file("mesh/room-0.ply").path), "mesh-only outdoor export needs no fake RoomPlan JSON")
+    let importedID = try ScanImport.importFolder(folder)
+    defer { try? fm.removeItem(at: HouseProject.url(forHouse: importedID)) }
+    let imported = try HouseProject.load(id: importedID)
+    expect(imported.sessions.first?.captureMode == .outdoor, "outdoor import retains house session capture mode")
+    expect(imported.sessions.first?.alignment.method == "unaligned" && imported.zones.first?.aligned == false, "outdoor import does not invent house alignment")
+    expect(imported.bundle(for: imported.sessions[0]).photos.count == exported.photos.count, "outdoor import preserves posed photo evidence")
+    let zip = try exported.zipped()
+    expect((try fm.attributesOfItem(atPath: zip.path)[.size] as? Int ?? 0) > 0, "outdoor session shares as ZIP")
+    FolderZipper.removeArchive(zip)
+    let wholeHouse = try FolderZipper.zip(imported.url, name: "Outdoor house")
+    expect(fm.fileExists(atPath: wholeHouse.path), "whole-house export includes outdoor sessions without changing house schema")
+    FolderZipper.removeArchive(wholeHouse)
+    let again = try CaptureController.start(houseID: house.id, zoneID: capture.plan.zoneID, mode: .outdoor)
+    expect(again.plan.zoneID != capture.plan.zoneID && !again.isContinue, "subsequent outdoor capture cannot reuse an earlier coordinate frame")
+    again.abandon()
+    expect(try HouseProject.load(id: house.id).sessions.count == 1, "cancel outdoor preserves earlier saved session")
+  }
+
+  private func outdoorRescanIsolation() throws {
+    let fm = FileManager.default
+    var house = HouseProject(id: "rescan-mode-test-" + UUID().uuidString, name: "Mode test", createdAt: Date())
+    try fm.createDirectory(at: house.url, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: house.url) }
+    let zone = house.addZone(named: "Test")
+    house.beginSession(id: "outdoor", zone: zone.id, alignment: .init(method: "unaligned"))
+    let outdoor = house.recordRoomScan(name: "Front wall", session: "outdoor", index: 0, capturedAt: Date())!
+    house.beginSession(id: "legacy-indoor", zone: zone.id, alignment: .init(method: "first"))
+    let indoor = house.recordRoomScan(name: "Office", session: "legacy-indoor", index: 0, capturedAt: Date())!
+    try house.save()
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    let legacy = try decoder.decode(HouseProject.self, from: Data(contentsOf: house.url.appendingPathComponent("house.json")))
+    expect(legacy.sessions.allSatisfy { $0.captureMode == nil }, "legacy house sessions decode without captureMode")
+    let bundle = try ScanBundle.create(in: house, id: "outdoor")
+    try bundle.writeManifest(Manifest(createdAt: Date(), device: "synthetic", systemVersion: "0", house: house.id, session: "outdoor", zone: zone.id,
+                                      rooms: [], photos: "photos/photos.json", photoCount: 0, captureMode: .outdoor))
+    house = try HouseProject.load(id: house.id)
+    expect(house.session("outdoor")?.captureMode == .outdoor, "legacy outdoor mode is recovered from its manifest")
+    expect(house.captureMode(for: indoor) == .indoor, "legacy indoor records remain eligible without mode metadata")
+    try house.save()
+    let reloaded = try decoder.decode(HouseProject.self, from: Data(contentsOf: house.url.appendingPathComponent("house.json")))
+    expect(reloaded.session("outdoor")?.captureMode == .outdoor, "optional session mode round-trips in house.json")
+
+    let capture = try CaptureController.start(houseID: house.id, zoneID: nil)
+    defer { capture.abandon() }
+    expect(capture.existingRooms.map(\.id) == [indoor.id] && capture.existingRoomNames == ["Office"], "indoor rescan lists exclude outdoor captures")
+    capture.selectRoom(outdoor)
+    expect(capture.selectedRoomID == nil && capture.roomName.isEmpty, "direct outdoor selection is rejected")
+    capture.selectRoom(indoor)
+    expect(capture.selectedRoomID == indoor.id && capture.canStartRoom, "legacy indoor selection still starts a rescan")
+    capture.selectedRoomID = outdoor.id
+    expect(!capture.canStartRoom, "start guard rejects bypassed or stale outdoor selection")
+
+    house = try HouseProject.load(id: house.id)
+    let before = house.rooms.first { $0.id == outdoor.id }!
+    let rejected = house.recordRoomScan(name: "Front wall", session: capture.plan.sessionID, index: 1, capturedAt: Date(), roomID: outdoor.id)
+    expect(rejected == nil && house.session(capture.plan.sessionID)?.rooms.isEmpty == true, "storage rejects cross-mode rescan before indexing it")
+    let after = house.rooms.first { $0.id == outdoor.id }!
+    expect(after.history == before.history && after.active == before.active && after.zone == before.zone, "rejected indoor rescan preserves outdoor history and active version")
+    let sameName = house.recordRoomScan(name: "Front wall", session: capture.plan.sessionID, index: 2, capturedAt: Date())!
+    expect(sameName.id != outdoor.id && house.rooms.first { $0.id == outdoor.id }?.history == before.history, "name matching cannot merge indoor and outdoor histories")
+
+    // Preserve and conservatively classify a mixed history written by an earlier app.
+    let ri = house.rooms.firstIndex { $0.id == outdoor.id }!
+    let oldIndoorRef = HouseProject.RoomRef(session: "legacy-indoor", index: 1, capturedAt: Date())
+    house.rooms[ri].history.append(oldIndoorRef)
+    house.rooms[ri].active = oldIndoorRef
+    try house.save()
+    let mixed = try HouseProject.load(id: house.id)
+    expect(mixed.captureMode(for: mixed.rooms[ri]) == .outdoor && mixed.rooms[ri].history.count == 2, "indoor active version cannot hide or erase earlier outdoor history")
+    let next = try CaptureController.start(houseID: house.id, zoneID: nil)
+    expect(!next.existingRooms.contains { $0.id == outdoor.id }, "mixed historical identity stays out of indoor rescan list")
+    next.abandon()
+  }
+
   func run() async -> Bool {
     var houseID: String?
     do {
       try await coveragePerformance()
       trackingRecovery()
       try roomExperience()
+      try await outdoorCapture()
+      try outdoorRescanIsolation()
       try captureDiagnostics()
       try await previewNormals()
       try await photoTextures()

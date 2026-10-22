@@ -328,6 +328,7 @@ final class DepthRecorder: @unchecked Sendable {
   private var last: (time: TimeInterval, pose: simd_float4x4)?
   private var next = 0
   private var inFlight = 0
+  private(set) var lastWriteFailure: String?
   private let ci = CIContext()
 
   init(bundle: ScanBundle) {
@@ -336,7 +337,7 @@ final class DepthRecorder: @unchecked Sendable {
 
   /// Call every frame; keeps one when the camera has moved or turned enough (≤ 5/s)
   func consider(_ frame: ARFrame, room: Int, camera: CameraState?, interval: TimeInterval = 0.2) {
-    guard let depth = frame.sceneDepth, inFlight < 3 else { return }
+    guard let depth = frame.sceneDepth, let confidence = depth.confidenceMap, inFlight < 3 else { return }
     guard case .normal = frame.camera.trackingState else { return }
     let pose = frame.camera.transform
     if let last {
@@ -362,20 +363,40 @@ final class DepthRecorder: @unchecked Sendable {
       rgbIntrinsics: kc.columnMajor, camera: camera, room: room, timestamp: frame.timestamp,
       width: w, height: h, transform: pose.columnMajor, intrinsics: k.columnMajor)
     let depthData = Self.float16(depth.depthMap)
-    let confData = depth.confidenceMap.map(Self.bytes)
+    let confData = Self.bytes(confidence)
     inFlight += 1
     queue.async {
-      try? ((try? (depthData as NSData).compressed(using: .zlib)) as Data? ?? depthData).write(to: self.bundle.file(record.file))
-      try? confData?.write(to: self.bundle.file(record.confidence))
-      if let cg, let rgb = record.rgb, let dest = CGImageDestinationCreateWithURL(self.bundle.file(rgb) as CFURL, "public.jpeg" as CFString, 1, nil) {
-        CGImageDestinationAddImage(dest, cg, [kCGImageDestinationLossyCompressionQuality: 0.8] as CFDictionary)
-        CGImageDestinationFinalize(dest)
+      let failure: String?
+      do {
+        // Never label uncompressed bytes .f16z or index files that failed to write.
+        let compressed = try (depthData as NSData).compressed(using: .zlib) as Data
+        try compressed.write(to: self.bundle.file(record.file), options: .atomic)
+        try confData.write(to: self.bundle.file(record.confidence), options: .atomic)
+        if let cg, let rgb = record.rgb {
+          guard let dest = CGImageDestinationCreateWithURL(self.bundle.file(rgb) as CFURL, "public.jpeg" as CFString, 1, nil) else {
+            throw CocoaError(.fileWriteUnknown)
+          }
+          CGImageDestinationAddImage(dest, cg, [kCGImageDestinationLossyCompressionQuality: 0.8] as CFDictionary)
+          guard CGImageDestinationFinalize(dest) else { throw CocoaError(.fileWriteUnknown) }
+        }
+        failure = nil
+      } catch {
+        failure = error.localizedDescription
+        for path in [record.file, record.confidence, record.rgb].compactMap({ $0 }) {
+          try? FileManager.default.removeItem(at: self.bundle.file(path))
+        }
       }
       DispatchQueue.main.async {
-        self.records.append(record)
+        if let failure { self.lastWriteFailure = failure }
+        else { self.records.append(record) }
         self.inFlight -= 1
       }
     }
+  }
+
+  /// Called on the main actor after capture input closes, before saving its index.
+  @MainActor func drain() async {
+    while inFlight > 0 { try? await Task.sleep(for: .milliseconds(25)) }
   }
 
   func save() throws {

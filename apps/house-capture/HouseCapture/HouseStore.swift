@@ -34,6 +34,13 @@ extension HouseProject {
 
   // MARK: queries
 
+  /// Any outdoor history keeps this identity out of indoor rescan/doorway workflows,
+  /// including legacy mixed histories whose active version happens to be indoor.
+  func captureMode(for room: Room) -> CaptureMode {
+    let refs = room.history + (room.active.map { [$0] } ?? [])
+    return refs.contains { session($0.session)?.captureMode == .outdoor } ? .outdoor : .indoor
+  }
+
   func sessionsInZone(_ zone: String) -> [Session] { sessions.filter { $0.zone == zone } }
 
   /// Sessions whose geometry is placed in the zone frame (anything but "unaligned")
@@ -70,9 +77,9 @@ extension HouseProject {
     return zone
   }
 
-  mutating func beginSession(id: String, zone: String, alignment: Alignment, at date: Date = Date()) {
+  mutating func beginSession(id: String, zone: String, alignment: Alignment, at date: Date = Date(), captureMode: CaptureMode? = nil) {
     sessions.removeAll { $0.id == id }
-    sessions.append(Session(id: id, zone: zone, startedAt: date, endedAt: nil, alignment: alignment))
+    sessions.append(Session(id: id, zone: zone, startedAt: date, endedAt: nil, alignment: alignment, captureMode: captureMode))
   }
 
   mutating func setAlignment(session id: String, _ alignment: Alignment) {
@@ -91,10 +98,14 @@ extension HouseProject {
   mutating func recordRoomScan(name: String, session id: String, index: Int, capturedAt: Date, roomID: String? = nil, matchName: Bool = true) -> Room? {
     guard let si = sessions.firstIndex(where: { $0.id == id }) else { return nil }
     let zone = sessions[si].zone
+    let mode = sessions[si].captureMode ?? .indoor
+    if let roomID, let target = rooms.first(where: { $0.id == roomID }), captureMode(for: target) != mode {
+      return nil // Reject cross-mode rescans before mutating either history or session indexes.
+    }
     if !sessions[si].rooms.contains(index) { sessions[si].rooms.append(index) }
     let ref = RoomRef(session: id, index: index, capturedAt: capturedAt)
     let key = Self.roomKey(name)
-    if let ri = rooms.firstIndex(where: { roomID != nil ? $0.id == roomID : matchName && Self.roomKey($0.name) == key }) {
+    if let ri = rooms.firstIndex(where: { roomID != nil ? $0.id == roomID : matchName && Self.roomKey($0.name) == key && captureMode(for: $0) == mode }) {
       rooms[ri].history.removeAll { $0.session == id && $0.index == index }
       rooms[ri].history.append(ref)
       rooms[ri].active = ref

@@ -23,7 +23,7 @@ struct FieldworkRoomScreen: View {
       if let house, let room {
         VStack(alignment: .leading, spacing: 22) {
           VStack(alignment: .leading, spacing: 10) {
-            FieldworkEyebrow(text: "Saved room")
+            FieldworkEyebrow(text: house.captureMode(for: room) == .outdoor ? "Saved outdoor capture" : "Saved room")
             Text(room.name).font(.largeTitle.weight(.bold)).tracking(-1)
             if let active = room.active {
               Text("SCANNED " + active.capturedAt.formatted(date: .abbreviated, time: .shortened).uppercased())
@@ -42,13 +42,18 @@ struct FieldworkRoomScreen: View {
             }
             VStack(spacing: 10) {
               Button { share(house.bundle(for: session), active.index, room.name) } label: {
-                Label(busy ? "Preparing room…" : "Share room", systemImage: "square.and.arrow.up")
+                Label(busy ? "Preparing…" : (house.captureMode(for: room) == .outdoor ? "Share outdoor capture" : "Share room"), systemImage: "square.and.arrow.up")
               }.buttonStyle(FieldworkButtonStyle()).disabled(busy)
+              if house.captureMode(for: room) != .outdoor {
               Button { onCapture(house.id, room.zone, nil, room.id) } label: {
                 Label("Continue scanning", systemImage: "viewfinder")
               }.buttonStyle(FieldworkButtonStyle(filled: false)).disabled(!CaptureController.isSupported || busy)
               Text("Start in this room so the phone can recognize your surroundings.")
                 .font(.caption).foregroundStyle(Fieldwork.secondary).frame(maxWidth: .infinity, alignment: .leading)
+              } else {
+                Text("Independent outdoor evidence. Start another outdoor capture from the house screen; align separate captures later on your Mac.")
+                  .font(.caption).foregroundStyle(Fieldwork.secondary)
+              }
             }
             FieldworkRule()
             DisclosureGroup(isExpanded: $historyOpen) {
@@ -63,10 +68,12 @@ struct FieldworkRoomScreen: View {
               } icon: { Image(systemName: "clock").foregroundStyle(Fieldwork.secondary).frame(width: 28) }
             }.padding(.vertical, 4)
             FieldworkRule()
+            if house.captureMode(for: room) != .outdoor {
             NavigationLink {
               RoomConnection(house: house, source: room, onSave: reload)
             } label: { actionRow("Connect room", subtitle: "Match a doorway with another scan", icon: "link") }
             FieldworkRule()
+            }
             Text("Photo detail measures useful photography on observed surfaces. It is not the percentage of the room scanned.")
               .font(.caption).foregroundStyle(Fieldwork.secondary)
           } else {
