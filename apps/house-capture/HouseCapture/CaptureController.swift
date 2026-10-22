@@ -17,6 +17,7 @@ struct CapturePlan {
   /// alignment of a fresh start: "first" (this session defines the zone frame) or "unaligned"
   var freshMethod: String
   var note: String?
+  var mode: CaptureMode = .indoor
 }
 
 /// Drives one capture session of a house: one ARSession, rooms scanned one after the other
@@ -74,6 +75,10 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
   @Published private(set) var rooms: [RoomRecord] = []
   @Published private(set) var photoCount = 0
   private let autoPhotos = true
+  var isOutdoor: Bool { plan.mode == .outdoor }
+  // Exposed internally for lifecycle regression checks: outdoor never creates RoomPlan.
+  var hasRoomPlanSession: Bool { roomSessionCreated }
+  @Published private(set) var outdoorDepthMessage = "Aim at a nearby wall or the ground."
   @Published var highResolutionPhotos = false
   @Published private(set) var trackingIssue: TrackingRecovery.Issue? = .starting
   @Published private(set) var sessionNeedsRestart = false
@@ -239,10 +244,13 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
 
   /// Set up a new session in a house: its folder, and its entry in house.json (so rooms are
   /// recorded as they finish). `newZone` makes a new area first.
-  static func start(houseID: String, zoneID: String?, newZone: String? = nil) throws -> CaptureController {
+  static func start(houseID: String, zoneID: String?, newZone: String? = nil, mode: CaptureMode = .indoor) throws -> CaptureController {
     var house = try HouseProject.load(id: houseID)
     var zone: HouseProject.Zone?
-    if let newZone {
+    if mode == .outdoor {
+      zone = house.addZone(named: "Outdoor capture")
+      if let i = house.zones.indices.last { house.zones[i].aligned = false }
+    } else if let newZone {
       zone = house.addZone(named: newZone)
     } else if let zoneID {
       zone = house.zone(zoneID)
@@ -265,7 +273,11 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
     let map = house.existingWorldMap(zone: zone)
     var plan = CapturePlan(houseID: houseID, zoneID: zone.id, sessionID: id, worldMap: nil, freshMethod: "first")
     let alignment: HouseProject.Alignment
-    if let map {
+    plan.mode = mode
+    if mode == .outdoor {
+      plan.freshMethod = "unaligned"
+      alignment = .init(method: "unaligned", note: OutdoorMetadata.coordinateNote)
+    } else if let map {
       plan.worldMap = map
       // until relocalization is verified (a crash mid-way leaves an honest record)
       alignment = .init(method: "unaligned", note: "relocalization not finished")
@@ -662,7 +674,7 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
     roomName = room.name
     selectedRoomID = room.id
   }
-  var canStartRoom: Bool { phase == .betweenRooms && !sessionNeedsRestart && !recordingSaveFailed && !requiresFreshScan && !roomName.trimmingCharacters(in: .whitespaces).isEmpty }
+  var canStartRoom: Bool { (!isOutdoor || rooms.isEmpty) && phase == .betweenRooms && !sessionNeedsRestart && !recordingSaveFailed && !requiresFreshScan && !roomName.trimmingCharacters(in: .whitespaces).isEmpty }
 
   func startRoom() {
     guard canStartRoom else { return }
@@ -689,7 +701,17 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
     applyGhostOpacity()
     refreshCoverage()
     diagnostics.log("room \(roomIndex) '\(roomName)' start", since: startedAt)
-    roomSession.run(configuration: RoomCaptureSession.Configuration())
+    if isOutdoor {
+      guard OutdoorCaptureCapabilities.isSupported else {
+        phase = .betweenRooms
+        lastWarning = "Outdoor capture requires ARKit world tracking, LiDAR mesh and scene depth."
+        return
+      }
+      arSession.run(OutdoorCaptureCapabilities.configuration(), options: [.resetTracking, .removeExistingAnchors])
+      ensureMeshAndDepth()
+    } else {
+      roomSession.run(configuration: RoomCaptureSession.Configuration())
+    }
     sessionRunning = true
     UIApplication.shared.isIdleTimerDisabled = true
     startTicking()
@@ -711,7 +733,16 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
       preStopMesh = await withCheckedContinuation { c in engine.exportPLY(to: file) { c.resume(returning: $0) } }
       guard !closed, phase == .finishingRoom else { return }
       cameraControl.unlock()
-      roomSession.stop(pauseARSession: false)
+      if isOutdoor {
+        arSession.pause()
+        sessionRunning = false
+        stopTicking()
+        UIApplication.shared.isIdleTimerDisabled = false
+        await finish(with: nil, error: nil)
+        await finishSession()
+      } else {
+        roomSession.stop(pauseARSession: false)
+      }
     }
   }
 
@@ -753,7 +784,7 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
     Task { @MainActor in await self.finish(with: data, error: error) }
   }
 
-  private func finish(with data: CapturedRoomData, error: Error?) async {
+  private func finish(with data: CapturedRoomData?, error: Error?) async {
     // .scanning: RoomPlan ended on its own (tracking failure, scene too big): keep what it has
     guard !closed, phase == .finishingRoom || phase == .scanning else { return }
     if error != nil { sessionNeedsRestart = true }
@@ -777,28 +808,34 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
     var record = RoomRecord(
       index: index, name: roomName.trimmingCharacters(in: .whitespaces), file: "rooms/room-\(index).json",
       usdz: "rooms/room-\(index).usdz", capturedAt: capturedAt, walls: 0, doors: 0, windows: 0, openings: 0, objects: 0)
-    // raw capture data first: RoomBuilder can be re-run on it later even if it fails now
-    let dataFile = bundle.file("rooms/room-\(index)-data.json")
-    let savedData = await Task.detached(priority: .utility) { () -> Bool in
-      guard let json = try? ScanBundle.encodeRoomData(data) else { return false }
-      return (try? json.write(to: dataFile, options: .atomic)) != nil
-    }.value
-    if savedData { record.data = "rooms/room-\(index)-data.json" }
-    do {
-      let room = try await RoomBuilder(options: [.beautifyObjects]).capturedRoom(from: data)
-      try bundle.saveRoom(room, index: index)
-      record.walls = room.walls.count
-      record.doors = room.doors.count
-      record.windows = room.windows.count
-      record.openings = room.openings.count
-      record.objects = room.objects.count
-      capturedRooms.append(room)
-      engine.setRoom(room)
-      scanView.showRoom(room)
-    } catch {
-      lastWarning = "RoomPlan couldn't build the layout (\(error.localizedDescription)). The mesh and photos are still saved."
-      record.file = "" // no layout for this room; capturedRooms only holds rooms RoomPlan built
+    if let data {
+      // raw capture data first: RoomBuilder can be re-run on it later even if it fails now
+      let dataFile = bundle.file("rooms/room-\(index)-data.json")
+      let savedData = await Task.detached(priority: .utility) { () -> Bool in
+        guard let json = try? ScanBundle.encodeRoomData(data) else { return false }
+        return (try? json.write(to: dataFile, options: .atomic)) != nil
+      }.value
+      if savedData { record.data = "rooms/room-\(index)-data.json" }
+      do {
+        let room = try await RoomBuilder(options: [.beautifyObjects]).capturedRoom(from: data)
+        try bundle.saveRoom(room, index: index)
+        record.walls = room.walls.count
+        record.doors = room.doors.count
+        record.windows = room.windows.count
+        record.openings = room.openings.count
+        record.objects = room.objects.count
+        capturedRooms.append(room)
+        engine.setRoom(room)
+        scanView.showRoom(room)
+      } catch {
+        lastWarning = "RoomPlan couldn't build the layout (\(error.localizedDescription)). The mesh and photos are still saved."
+        record.file = "" // no layout for this room; capturedRooms only holds rooms RoomPlan built
+        record.usdz = ""
+      }
+    } else {
+      record.file = ""
       record.usdz = ""
+      record.captureMode = .outdoor
     }
     let meshFile = "mesh/room-\(index).ply"
     var result = preStopMesh
@@ -808,10 +845,16 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
     if case .success(let r)? = result, r.vertices > 0 {
       record.mesh = MeshRecord(file: meshFile, anchors: 0, vertices: r.vertices, faces: r.faces)
       record.coverage = r.covered
+    } else if isOutdoor {
+      lastWarning = "No mesh was saved. Available photos and depth are kept; review the exported evidence before relying on this capture."
     }
     record.photoCoverage = record.photographedPercent
     record.detailSeconds = roomStartedAt.map { Date().timeIntervalSince($0) }
     record.detailPhotos = roomPhotoCount
+    await depthRecorder.drain()
+    if let failure = depthRecorder.lastWriteFailure {
+      lastWarning = "Some depth frames could not be written: \(failure). Only completed frames are indexed."
+    }
     rooms.append(record)
     pendingRoomIDs[index] = selectedRoomID
     do {
@@ -918,7 +961,7 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
         structureError = error.localizedDescription
       }
     }
-    await buildZoneStructure()
+    if !isOutdoor { await buildZoneStructure() }
     try? writeManifest(structure: structureFile, structureError: structureError)
     phase = .done
   }
@@ -968,6 +1011,8 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
   /// as the zone's map. Only once ARKit calls the map `.mapped` (`.extending` is accepted with
   /// a note: it relocalizes less reliably); the final save waits a few seconds for `.mapped`.
   private func saveWorldMap(final: Bool) async {
+    // Outdoor captures are independent evidence; never advertise a map for indoor continuation.
+    guard !isOutdoor else { return }
     while mapSaving { try? await Task.sleep(for: .milliseconds(100)) }
     guard sessionRunning else { return }
     if final {
@@ -1049,7 +1094,9 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
       photoCount: photos.count,
       depthFrames: depthRecorder.records.isEmpty ? nil : "depth/frames.json",
       depthFrameCount: depthRecorder.records.count,
-      diagnostics: diagnostics
+      diagnostics: diagnostics,
+      captureMode: isOutdoor ? .outdoor : nil,
+      outdoor: isOutdoor ? OutdoorMetadata() : nil
     ))
   }
 
@@ -1092,7 +1139,8 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
   private func ensureMeshAndDepth() {
     guard let c = arSession.configuration as? ARWorldTrackingConfiguration else { return }
     let depthOK = !ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) || c.frameSemantics.contains(.sceneDepth)
-    let meshOK = c.sceneReconstruction.contains(.meshWithClassification)
+    let reconstruction: ARConfiguration.SceneReconstruction = isOutdoor ? OutdoorCaptureCapabilities.reconstruction : .meshWithClassification
+    let meshOK = c.sceneReconstruction.contains(reconstruction)
     if meshOK, depthOK {
       if !meshReady {
         meshReady = true
@@ -1102,11 +1150,11 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
       return
     }
     guard let updated = c.copy() as? ARWorldTrackingConfiguration else { return }
-    if diagnostics.roomPlanConfiguration == nil {
+    if !isOutdoor, diagnostics.roomPlanConfiguration == nil {
       diagnostics.roomPlanConfiguration = "\(type(of: c)) reconstruction=\(c.sceneReconstruction.rawValue) semantics=\(c.frameSemantics.rawValue) worldMap=\(c.initialWorldMap != nil)"
     }
     updated.initialWorldMap = nil
-    updated.sceneReconstruction.insert(.meshWithClassification)
+    updated.sceneReconstruction.insert(reconstruction)
     if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) { updated.frameSemantics.insert(.sceneDepth) }
     meshReady = false
     diagnostics.configurationChanges = (diagnostics.configurationChanges ?? 0) + 1
@@ -1317,8 +1365,9 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
     if frame.timestamp - lastMeshCheck > 0.5 {
       lastMeshCheck = frame.timestamp
       ensureMeshAndDepth()
+      if isOutdoor { outdoorDepthMessage = OutdoorDepthQuality.message(for: frame.sceneDepth) }
     }
-    if !cameraControl.whiteBalanceLocked, let t = meshReadyAt, now - t > 3 {
+    if !isOutdoor, !cameraControl.whiteBalanceLocked, let t = meshReadyAt, now - t > 3 {
       cameraControl.lockWhiteBalance()
       diagnostics.whiteBalance = cameraControl.summary
     }
@@ -1371,6 +1420,11 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
     guard frame.timestamp - lastPhotoTime > captureBudget.photoInterval, blur <= Self.acceptableBlur else { return }
     let recent = photoViews.suffix(8)
     guard recent.allSatisfy({ simd_distance($0.view.position, view.position) > 0.12 || simd_dot($0.view.forward, view.forward) < cos(Float.pi / 18) }) else { return }
+    // Outdoors, keep overlapping posed photos even when sun or distance weakens LiDAR.
+    if isOutdoor {
+      hold(frame, blur: blur)
+      return
+    }
     if stats.meshArea > 0.5 || stats.targetsCovered > 0 || liveRoom != nil {
       guard engine.latestGain > Self.minimumGain else { return }
     } else {

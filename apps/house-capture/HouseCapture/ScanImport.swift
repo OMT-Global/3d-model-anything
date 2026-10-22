@@ -32,16 +32,17 @@ enum ScanImport {
     var house = HouseProject(id: id, name: manifest.rooms.count == 1 ? manifest.rooms[0].name : (manifest.houseName ?? "Imported rooms"), createdAt: Date())
     var committed = false
     defer { if !committed { try? fm.removeItem(at: house.url) } }
-    let zone = house.addZone(named: "Imported rooms")
+    let zone = house.addZone(named: manifest.captureMode == .outdoor ? "Imported outdoor capture" : "Imported rooms")
+    if manifest.captureMode == .outdoor { house.zones[0].aligned = false }
     for room in manifest.rooms {
       let sessionID = "room-\(room.index)"
       let bundle = try ScanBundle.create(in: house, id: sessionID)
       try ScanBundle(url: root).exportRoom(index: room.index, name: room.name, to: bundle.url)
       guard var exported = bundle.manifest else { throw CocoaError(.fileReadCorruptFile) }
       exported.house = id; exported.houseName = house.name
-      exported.session = sessionID; exported.zone = zone.id; exported.alignment = .init(method: "first")
+      exported.session = sessionID; exported.zone = zone.id; exported.alignment = .init(method: exported.captureMode == .outdoor ? "unaligned" : "first")
       try bundle.writeManifest(exported)
-      house.beginSession(id: sessionID, zone: zone.id, alignment: .init(method: "first"), at: room.capturedAt)
+      house.beginSession(id: sessionID, zone: zone.id, alignment: exported.alignment!, at: room.capturedAt)
       house.recordRoomScan(name: room.name, session: sessionID, index: room.index, capturedAt: room.capturedAt, matchName: false)
       house.endSession(sessionID)
     }

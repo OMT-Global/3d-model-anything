@@ -108,11 +108,11 @@ struct HomeView: View {
           newName = houses.isEmpty ? "Our house" : ""
           naming = true
         } label: { Label("New house", systemImage: "plus") }
-          .buttonStyle(FieldworkButtonStyle()).disabled(!CaptureController.isSupported)
+          .buttonStyle(FieldworkButtonStyle()).disabled(!CaptureController.isSupported && !OutdoorCaptureCapabilities.isSupported)
           .padding(.horizontal, 24).padding(.top, 12).padding(.bottom, 10).background(Fieldwork.paper)
       }
       .navigationDestination(for: String.self) { id in
-        HouseScreen(houseID: id, generation: generation, onCapture: startCapture, onGone: { path.removeAll() })
+        HouseScreen(houseID: id, generation: generation, onCapture: startCapture, onGone: { path.removeAll() }, onOutdoorCapture: startOutdoorCapture)
       }
       .onAppear(perform: reload)
       .alert("Something went wrong", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
@@ -127,10 +127,11 @@ struct HomeView: View {
       }
       .alert("New house", isPresented: $naming) {
         TextField("Name", text: $newName)
-        Button("Create and scan", action: createHouse)
+        Button("Create and scan room") { createHouse() }.disabled(!CaptureController.isSupported)
+        Button("Create for outdoor capture") { createHouse(mode: .outdoor) }.disabled(!OutdoorCaptureCapabilities.isSupported)
         Button("Cancel", role: .cancel) {}
       } message: {
-        Text("Then scan your first room. You can add more rooms later.")
+        Text("Choose an indoor room scan or an outdoor capture. Add more captures later.")
       }
       .confirmationDialog("Delete \(deleting?.name ?? "house")?", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }), titleVisibility: .visible) {
         Button("Delete house and all its scans", role: .destructive) {
@@ -144,7 +145,11 @@ struct HomeView: View {
         Text("This removes every session, photo and mesh of this house from the phone.")
       }
       .fullScreenCover(item: $capture, onDismiss: captureClosed) { controller in
-        CaptureScreen(controller: controller) { capture = nil }
+        if controller.isOutdoor {
+          OutdoorCaptureScreen(controller: controller) { capture = nil }
+        } else {
+          CaptureScreen(controller: controller) { capture = nil }
+        }
       }
     }
     .tint(Fieldwork.orange)
@@ -168,21 +173,33 @@ struct HomeView: View {
     reload()
   }
 
-  private func createHouse() {
+  private func createHouse(mode: CaptureMode = .indoor) {
     guard !working else { return }
     let name = newName.trimmingCharacters(in: .whitespacesAndNewlines)
     working = true
     Task {
       defer { working = false }
       do {
-        try await CaptureReadiness.prepare()
+        try await CaptureReadiness.prepare(mode: mode)
         var house = try HouseProject.create(name: name.isEmpty ? "House" : name)
-        let zone = house.addZone(named: "Area 1")
+        let zone = mode == .indoor ? house.addZone(named: "Area 1") : nil
         try house.save()
         reload()
         path = [house.id]
         try? await Task.sleep(for: .milliseconds(450))
-        capture = try CaptureController.start(houseID: house.id, zoneID: zone.id)
+        capture = try CaptureController.start(houseID: house.id, zoneID: zone?.id, mode: mode)
+      } catch { self.error = error.localizedDescription }
+    }
+  }
+
+  private func startOutdoorCapture(houseID: String) {
+    guard !working else { return }
+    working = true
+    Task {
+      defer { working = false }
+      do {
+        try await CaptureReadiness.prepare(mode: .outdoor)
+        capture = try CaptureController.start(houseID: houseID, zoneID: nil, mode: .outdoor)
       } catch { self.error = error.localizedDescription }
     }
   }

@@ -168,3 +168,68 @@ Camera permission is checked before creating a capture. Scanning requires 500 MB
 start/resume and pauses below 200 MB; this is a reserve, not a guarantee against other processes
 using storage. Save errors are shown, and failed session saves can be retried without closing.
 Backgrounding still pauses recording. Development launch modes are enabled only in Debug builds.
+
+## Outdoor capture (iPhone app)
+
+Choose **Create for outdoor capture** when creating a house, or **Capture outdoors** in an
+existing house. Name one nearby area (for example, “Front entrance”), start capture, move slowly
+with overlapping views of the building and ground, then **Stop and save**. Pause/resume and manual
+photos remain available. Backgrounding pauses recording; tracking loss stops new evidence until
+tracking is stable. A fatal tracking failure requires saving and starting a fresh capture. Review
+in 3D, share the ZIP directly from the saved screen, or reopen it from the house library and share.
+The indoor **Scan a room** path still uses RoomPlan.
+
+Outdoor mode uses a fresh `ARSession` with `ARWorldTrackingConfiguration`, gravity alignment,
+scene reconstruction and scene depth. It never creates or runs `RoomCaptureSession`, never
+flattens the mesh with plane detection, and does not save a continuation world map. Runtime
+checks require world tracking, mesh reconstruction and scene depth (LiDAR). Classification is
+used when supported; it is ARKit's estimate, not an outdoor semantic inventory. APIs are
+available below the app's iOS 17 deployment target and were checked against the Xcode 27 SDK:
+[scene reconstruction](https://developer.apple.com/documentation/arkit/arworldtrackingconfiguration/scenereconstruction),
+[depth capability checks](https://developer.apple.com/documentation/arkit/arconfiguration/supportsframesemantics(_:)),
+and [ARDepthData](https://developer.apple.com/documentation/arkit/ardepthdata).
+
+The guidance samples finite depth within 5 m at medium/high confidence; the 20% threshold is a
+warning heuristic, not calibrated accuracy or area completeness. Sun, reflective glass, distant
+surfaces, vegetation and weak texture can cause missing geometry or drift. Automatic posed photos
+continue with overlapping views even when LiDAR is weak, including downward views of ground.
+Depth/confidence/RGB recordings keep the existing formats. Stop waits for accepted photo and depth
+writes; failed depth sets are omitted from the index and reported. Photos and depth can be useful
+when no mesh was captured, but the 3D preview can then be empty.
+
+The bundle remains `house-capture/5` with optional `captureMode: "outdoor"` and `outdoor` metadata
+(source, scope, coordinates, limitations). Its single `rooms` entry also has `captureMode: "outdoor"`;
+`file` and `usdz` are empty and there is no fabricated RoomPlan layout or structure. The existing
+`room` index in photos/depth refers to that capture entry. Mesh, sensor pixels, poses, intrinsics,
+confidence and depth are raw evidence for later reconstruction on a Mac. Existing indoor bundles
+omit these optional fields and need no migration. Room/session export, whole-house sharing and
+extracted-folder import retain outdoor metadata. Whole-house import is still unsupported.
+
+Each outdoor capture is unaligned, including after import, and starts in an independent local
+ARKit frame. There is no GPS/georeferencing, full-property reconstruction, boundary determination,
+adjacency inference or survey-accuracy promise. Outdoor captures cannot continue an indoor map or
+use doorway alignment. Separate patches need explicit alignment later. Old RoomPlan-only conversion
+scripts must recognize the outdoor marker and use mesh/photos/depth rather than expect a room JSON.
+
+### Physical outdoor acceptance test (pending hardware)
+
+Use a Release build on an authorized LiDAR iPhone with iOS 17 or later. A simulator cannot validate
+sensor quality, thermal behavior or outdoor tracking. No physical-device install is part of this change.
+
+1. Capture a small nearby textured wall and ground in shade. Confirm mesh appears, photos increase,
+   manual shutter works, and Stop saves a mesh-only capture that reopens and shares.
+2. Repeat in direct sunlight and toward glass/distant scenery. Confirm weak-depth guidance and that
+   photo evidence remains available; inspect actual gaps rather than treating the warning as accuracy.
+3. Pan too fast, cover the camera, then return to the same textured view. Confirm tracking pauses
+   evidence and resumes only after stable tracking; save while tracking is lost. If ARKit fails,
+   confirm saving remains possible and a new patch starts with a new frame.
+4. Pause, background/foreground, resume, and Stop immediately after taking a photo. Verify no late
+   writes are missing from exported indexes. Cancel a different patch and confirm earlier scans remain.
+5. Exercise low storage and a long warm-device capture. Confirm preflight/pause warnings, reduced
+   capture load, visible write failures and retryable index-save errors without losing prior scans.
+6. AirDrop/share ZIP to Files or a Mac; unzip, verify all indexed files exist, decode depth as raw
+   DEFLATE Float16 meters, and confirm camera matrices/intrinsics match unrotated sensor images.
+   Import the extracted folder on iOS and check outdoor/unaligned metadata persists.
+7. Scan an indoor room, save, review, export/import it and share a house containing both modes.
+   Verify old room history and saved scans are unchanged and outdoor patches are not automatically
+   positioned against indoor rooms.

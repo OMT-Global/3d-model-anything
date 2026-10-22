@@ -25,7 +25,7 @@ targets:
       path: HouseCapture/Info.plist
       properties:
         CFBundleDisplayName: 3D Model Anything
-        NSCameraUsageDescription: 3D Model Anything uses the camera and LiDAR scanner to measure your rooms and take reference photos.
+        NSCameraUsageDescription: 3D Model Anything uses the camera and LiDAR scanner to capture rooms and nearby outdoor surfaces, and take reference photos.
         # Non-LiDAR devices can import and review scans; capture is checked at runtime.
         ITSAppUsesNonExemptEncryption: false
         HouseCapturePrivacyURL: "https://wesbos.github.io/3d-model-anything/privacy.html"

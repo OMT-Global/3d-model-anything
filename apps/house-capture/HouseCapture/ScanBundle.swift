@@ -279,6 +279,9 @@ struct Manifest: Codable {
   var depthFrames: String?
   var depthFrameCount: Int?
   var diagnostics: Diagnostics?
+  /// Absent in existing indoor bundles. Geometry without RoomPlan is explicitly marked.
+  var captureMode: CaptureMode?
+  var outdoor: OutdoorMetadata?
 }
 
 /// What the capture session actually did, for debugging bundles after the fact
@@ -403,6 +406,7 @@ struct RoomRecord: Codable, Identifiable {
   var detailPhotos: Int?
   /// house-capture/5: RoomPlan's raw CapturedRoomData ("rooms/room-N-data.json")
   var data: String?
+  var captureMode: CaptureMode?
   var id: Int { index }
 }
 
