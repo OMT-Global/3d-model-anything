@@ -19,14 +19,16 @@ class GatedPublisher:
 
 
 class OfficialCodexRunner:
-    """Production needs separately scoped deployment/auth/transfer approval.
+    """Developer-only legacy repository proof; never a customer onboarding path.
 
     An operator may prove synthetic jobs with existing authorized local client access.
     That proof does not connect the phone or authorize private scan transfer.
 
     The official binary owns ChatGPT subscription authentication. These calls do not
     create credentials, select a model, upload ZIPs, apply patches or execute output.
-    The remote host can be Linux. The working directory is an operator-owned checkout.
+    This legacy API requires a repository environment. Sharing or hiding a developer
+    repository does not provide per-user subscription authorization or isolation.
+    A repo-free production provider remains unimplemented. The proof host can be Linux.
     """
     def __init__(self, binary, environment, branch, working_directory, transfer, run=subprocess.run):
         if not all((binary, environment, branch, working_directory, transfer)):

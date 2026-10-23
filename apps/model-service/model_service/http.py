@@ -2,12 +2,16 @@
 import json
 import mimetypes
 from pathlib import Path
-from .adapters import GatedRunner, GatedPublisher
+from .adapters import GatedRunner, GatedPublisher, OfficialCodexRunner
 from .contracts import Principal, Problem, canonical
 
 
 class Application:
     def __init__(self, service, authenticate=lambda environ: None, viewer=None):
+        # A developer's repository/environment is not a customer authorization or
+        # isolation boundary. Keep the legacy proof out of the mobile HTTP service.
+        if isinstance(service.runner, OfficialCodexRunner):
+            raise ValueError('Legacy repository Cloud runner is developer-only; the mobile service requires a repo-free provider.')
         self.service, self.authenticate = service, authenticate
         self.viewer = Path(viewer).resolve() if viewer else None
 
@@ -30,6 +34,9 @@ class Application:
             if path == '/v1/capabilities' and method == 'GET':
                 result = {'mode': 'synthetic' if self.service.synthetic else 'integration',
                           'model': principal.can_model, 'publish': principal.can_publish,
+                          'endUserRepositoryRequired': False,
+                          # No supported repo-free Cloud provider is implemented yet.
+                          'repoFreeCloudAvailable': False,
                           'cloudAdapterConfigured': not isinstance(self.service.runner, GatedRunner),
                           'siteAdapterConfigured': not isinstance(self.service.publisher, GatedPublisher)}
             elif len(parts) >= 3 and parts[:2] == ['v1', 'rooms']:

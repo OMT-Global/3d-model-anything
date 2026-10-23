@@ -36,6 +36,9 @@ final class WorkflowUITests: XCTestCase {
   func testUnconfiguredCloudAndSiteAreExplicitlyGated() {
     let app = XCUIApplication(); app.launchArguments = ["-workflow-gated"]; app.launch()
     XCTAssertTrue(app.staticTexts["Setup required"].waitForExistence(timeout: 10))
+    let noRepositorySetup = app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "will not ask you to create a GitHub account or repository")).firstMatch
+    XCTAssertTrue(noRepositorySetup.exists)
+    let modelGate = XCTAttachment(screenshot: app.screenshot()); modelGate.name = "Repo-free-cloud-setup-gate"; modelGate.lifetime = .keepAlways; add(modelGate)
     XCTAssertFalse(app.buttons["Start synthetic model"].exists)
     app.segmentedControls.buttons["Publish"].tap()
     XCTAssertTrue(app.staticTexts["Publish to your private Site"].waitForExistence(timeout: 5))

@@ -82,11 +82,11 @@ struct RoomWorkflowScreen: View {
       Image(systemName: stage == .model ? "cloud" : "lock.shield").font(.largeTitle).foregroundStyle(Fieldwork.orange)
       Text(stage == .model ? "Model with Codex Cloud" : "Publish to your private Site").font(.title2.bold())
       Text(stage == .model
-           ? "Create an editable room revision using your ChatGPT subscription. Cloud access and private scan transfer need to be connected before you can start."
+           ? "Cloud modeling with your ChatGPT account is not connected yet. This app will not ask you to create a GitHub account or repository."
            : "Preview and approve a model revision, then publish it to a protected ChatGPT Site. Your last working publication stays available until the new version is verified.")
       Label("Setup required", systemImage: "pause.circle").font(.headline)
       Text(stage == .model
-           ? "No Cloud job has started. A Pro account alone does not connect or authorize this app."
+           ? "Your scans stay on this device. Try the sample workflow below while cloud modeling remains unavailable."
            : "No Site is connected. Site sign-in and permission to publish must be configured separately.")
         .font(.subheadline).foregroundStyle(Fieldwork.secondary)
       NavigationLink {

@@ -164,6 +164,26 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(self.request(app, '/v1/rooms/room/commands', 'POST', {'id': 'model', 'kind': 'model', 'scanID': 'scan'})[0][0].startswith('200'))
         self.assertEqual(self.runner.submissions, 0)  # GETs/command reservation do not launch a worker.
 
+    def test_mobile_service_rejects_legacy_repository_runner_before_any_call(self):
+        def forbidden_call(*args, **kwargs):
+            self.fail('Constructing the mobile service must not invoke the Cloud client')
+        runner = OfficialCodexRunner('/official/codex', 'developer-env', 'feature', self.tmp.name,
+                                     SimpleNamespace(), forbidden_call)
+        service = Service(self.path, runner)
+        with self.assertRaisesRegex(ValueError, 'repo-free provider'):
+            Application(service, lambda _: self.user)
+        self.assertEqual(service.snapshot(self.user, 'room')['jobs'], [])
+
+    def test_capabilities_do_not_mistake_local_demo_or_permissions_for_repo_free_cloud(self):
+        for service in (self.service, Service(self.path)):
+            app = Application(service, lambda _: self.user)
+            (status, _), payload = self.request(app, '/v1/capabilities')
+            self.assertTrue(status.startswith('200'))
+            capabilities = json.loads(payload)
+            self.assertTrue(capabilities['model'])  # Permission is distinct from availability.
+            self.assertFalse(capabilities['endUserRepositoryRequired'])
+            self.assertFalse(capabilities['repoFreeCloudAvailable'])
+
     def test_http_end_to_end_contract(self):
         app = Application(self.service, lambda _: self.user)
         def req(suffix, body):

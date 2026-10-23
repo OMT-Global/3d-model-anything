@@ -82,7 +82,7 @@ enum WorkflowError: LocalizedError {
   case setupRequired, invalidModel, pending, rejected(String), invalidResponse
   var errorDescription: String? {
     switch self {
-    case .setupRequired: return "Cloud modeling needs an approved remote launcher and private scan transfer. Protected Site publishing also needs setup. Your scans stay on this device."
+    case .setupRequired: return "Cloud modeling is not connected yet. No GitHub setup is required from you. Protected Site publishing also needs setup. Your scans stay on this device."
     case .invalidModel: return "This model contains unsupported or invalid geometry. The previous revision is still available."
     case .pending: return "Retry the pending request before starting another action."
     case .rejected(let message): return message
