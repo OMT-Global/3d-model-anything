@@ -1,6 +1,6 @@
 {
   "title": "Help & support",
-  "updated": "October 7, 2026",
+  "updated": "October 23, 2026",
   "sections": [
     {
       "title": "Supported devices",
@@ -33,6 +33,10 @@
     {
       "title": "Recover or remove a room",
       "body": "Room options → Delete room moves it to Recently Deleted, below the house’s room list. Restore it there or delete it permanently. Deleting a house removes its scans permanently after confirmation. Shared files and device backups are separate copies."
+    },
+    {
+      "title": "Model and publish",
+      "body": "Open a saved room → Model & publish. Scan, Model and Publish are separate stages. Cloud reconstruction and protected ChatGPT Site publication require setup and are not connected in this version. Try synthetic workflow uses only a sample studio: create a model, edit a new revision, approve it and publish a local demo. Your original scans are not uploaded or modified. You can reopen the workflow to resume progress."
     },
     {
       "title": "If something goes wrong",

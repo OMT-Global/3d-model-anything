@@ -20,6 +20,7 @@
     "apps/room-viewer/src",
     "apps/room-viewer/tools",
     "demos",
-    "packages"
+    "packages",
+    "apps/protected-viewer/src"
   ]
 }

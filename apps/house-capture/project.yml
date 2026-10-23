@@ -38,3 +38,21 @@ targets:
         UIStatusBarHidden: false
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
         UISupportedInterfaceOrientations~ipad: [UIInterfaceOrientationPortrait, UIInterfaceOrientationPortraitUpsideDown]
+
+  HouseCaptureWorkflowUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [WorkflowUITests]
+    dependencies:
+      - target: HouseCapture
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: com.wesbos.housecapture.workflow-tests
+schemes:
+  HouseCapture:
+    build:
+      targets:
+        HouseCapture: all
+    test:
+      targets: [HouseCaptureWorkflowUITests]

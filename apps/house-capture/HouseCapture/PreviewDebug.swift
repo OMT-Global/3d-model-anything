@@ -28,6 +28,12 @@ enum PreviewDebug {
   /// App entry: `if let preview = PreviewDebug.launchView() { preview } else { … }`
   @MainActor static func launchView() -> AnyView? {
     #if DEBUG
+    if args.contains("-workflow-demo") {
+      return AnyView(NavigationStack { RoomWorkflowScreen(roomID: value("-workflow-demo-id") ?? "fixture", synthetic: true) }.tint(Fieldwork.orange).preferredColorScheme(.light))
+    }
+    if args.contains("-workflow-gated") {
+      return AnyView(NavigationStack { RoomWorkflowScreen(roomID: "fixture") }.tint(Fieldwork.orange).preferredColorScheme(.light))
+    }
     // Open the real Fieldwork room screen against simulator fixtures for visual checks.
     if let houseID = value("-fieldwork-house"), let roomID = value("-fieldwork-room") {
       return AnyView(NavigationStack {

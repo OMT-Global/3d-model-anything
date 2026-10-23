@@ -168,3 +168,7 @@ Camera permission is checked before creating a capture. Scanning requires 500 MB
 start/resume and pauses below 200 MB; this is a reserve, not a guarantee against other processes
 using storage. Save errors are shown, and failed session saves can be retried without closing.
 Backgrounding still pauses recording. Development launch modes are enabled only in Debug builds.
+
+## Scan → Model → Publish (feature preview)
+
+Saved rooms now link to **Model & publish** with three explicit stages. Cloud reconstruction and protected ChatGPT Site publication show setup gates. **Try synthetic workflow** exercises local progress, editable model revisions, approval, and publication recovery without reading or uploading a scan. No remote service is configured in the app. See [workflow implementation and live gates](../../docs/SCAN-MODEL-PUBLISH.md).

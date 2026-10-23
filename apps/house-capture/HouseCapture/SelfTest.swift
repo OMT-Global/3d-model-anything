@@ -121,6 +121,8 @@ final class SelfTest {
     var houseID: String?
     do {
       try await coveragePerformance()
+      try await ModelWorkflowSelfTest.run()
+      expect(true, "model workflow persistence and retry regressions")
       whiteBalanceSafety()
       trackingRecovery()
       try roomExperience()

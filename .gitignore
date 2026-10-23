@@ -15,3 +15,9 @@ data/scans/
 apps/house-capture/release/screenshots/
 
 HouseCapture.xcodeproj/
+
+# Private reconstruction state and artifacts (never deploy with the public viewer)
+data/model-workflow/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

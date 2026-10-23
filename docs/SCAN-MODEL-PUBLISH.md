@@ -1,0 +1,102 @@
+# Scan → Model → Publish
+
+This branch builds on the camera white-balance fix in PR #3 (`c155dbc`). Its draft PR is stacked on `fix/iphone-white-balance`; the independent local-preview and outdoor-capture PRs are not included. Keep both draft PRs unmerged until iPhone testing and explicit merge authorization. There is no deployment in this change.
+
+## What works now
+
+- **Scan:** existing capture, preview, sharing and history remain available. The saved-room page adds an explicit Scan → Model → Publish entry. Scan formats and files are unchanged.
+- **Model:** the iOS screen shows the Cloud setup gate. A separately labeled, on-device synthetic workflow demonstrates durable job progress, reopening, an editable 3D model, and immutable revisions. It never reads a user's scan. Room/object labels, sample-table position, width and material are editable. The deliberately small `editable-room/1` format supports boxes; this is a foundation for reconstruction, not a claim of photo-realistic modeling.
+- **Publish:** the user approves one exact immutable revision, then explicitly publishes. The synthetic app stores a local publication only. Editing creates a new unapproved revision; earlier revisions and the previous publication remain available.
+- **Portable service:** standard-library Python with SQLite implements authenticated owner-scoped commands, durable idempotency, progress, revision approval, and publication recovery. It runs on Linux; no runtime Mac relay or Apple framework is needed.
+- **Official-client integration:** `OfficialCodexRunner` invokes the installed official `codex cloud exec/status` client with one attempt, an explicit environment and branch. Prompt input goes over stdin. Official ChatGPT subscription auth remains inside that client. This adapter is implemented and tested against process fixtures, **not validated by starting a live Cloud job**.
+- **Private viewer template:** a separate Three.js build reads only the authenticated user's published revision. The service authenticates HTML, JS, model data and all asset routes; it denies access by default. It is not added to GitHub Pages or the public demo bundle.
+
+## Deliberate live gates
+
+The release app has no configured remote endpoint, no login flow, no upload button, no copied OAuth identity or token, and no paid API fallback. `RemoteWorkflowTransport` is an HTTPS integration seam, not an active connection. A ChatGPT Pro subscription is assumed for the intended product, but neither a Site login nor an app principal proves subscription entitlement or authority to spend usage. The operator must explicitly authorize model execution, and the official client enforces actual account access and availability.
+
+The default service uses `GatedRunner` and `GatedPublisher`. This repository does not implement a public ChatGPT Sites provisioning API, a Sites deployment, a private object store, or a scan upload gateway. Configuring a publisher means supplying a separately verified adapter to one pre-created private Site. The synthetic harness does not validate any provider's authentication or hosting policy.
+
+Before enabling live use, separately scope and approve:
+
+| Provider/resource | Exact action and scope still needed | Cost status |
+| --- | --- | --- |
+| OpenAI / user-owned remote launcher and existing Codex Cloud environment | Select the actual host and environment ID, install/use official client, and authorize subscription-backed task submission. No host or environment is provisioned by this PR. New auth grants require approval. | Existing subscription usage; hosting cost depends on the selected host. No purchase made. |
+| Private storage / provider and bucket not yet selected | Approve authenticated upload/download of one selected room, retention, quotas, short-lived grants, task identity binding and egress policy. No home data has been uploaded. | Unknown until resource selected; no paid storage created. |
+| ChatGPT Sites / pre-created private viewer not yet identified | Verify supported update interface, visitor ACLs, owner publish authorization, protection of every asset endpoint, immutable version staging, health check and atomic publication pointer. | No Site created or published; any provider costs need approval. |
+| iOS / app authorization | Supply short-lived app credentials and account binding through an approved login flow, then connect `RemoteWorkflowTransport` and private scan selection. Codex credentials must never be supplied to the phone. | No new credentials or persistent access created. |
+
+No integration should declare itself live simply because its configuration values are present. Start with a synthetic live task after these gates are approved, then obtain explicit approval before using private scans.
+
+## Data and transport contract
+
+`editable-room/1` is bounded JSON: a room label plus 1–500 unique objects containing `id`, `label`, `kind: box`, `position`, `size` (three finite meter values, absolute values at most 100, positive dimensions), and `#RRGGBB` color. No script, arbitrary URL, shader or executable code is accepted. Both the service and app validate it. Future marketplace objects need a new versioned asset contract with licensed, authorized, digest-pinned assets; a marketplace is out of scope.
+
+The **private input gateway**, once implemented, must authenticate the owner, accept only the explicitly selected room export, enforce size/path/archive limits and verify a SHA-256 before registering an immutable scan ID. The service accepts only a sealed descriptor `{kind, assetID, sha256}`. `assetID` is opaque; the service does not fetch arbitrary URLs, open client-supplied paths or put scan data in Git. A trusted gateway calls `register_scan`; no unverified public registration/upload route is exposed.
+
+`PrivateTransfer.prompt(job_id, scan)` must issue short-lived, least-privilege input/output grants associated with the owner, job, sealed scan digest and approved Cloud environment. Only the associated task may download inputs or upload its result. Put no long-lived credentials in prompts. Define expiry, revocation, output size limits and cleanup before enabling this adapter. Treat scan contents and generated text as untrusted evidence. The job should read the repository's scan-to-threejs guidance and preserve coordinate transforms, measurements and uncertainty, returning a bounded data model through the private gateway. Do not commit scans or generated private artifacts into this public repository.
+
+The gateway's authenticated `read_result(task_id, scan)` must return:
+
+```json
+{
+  "format": "reconstruction-result/1",
+  "taskID": "task_example",
+  "scanSHA256": "<sealed input SHA-256>",
+  "documentSHA256": "<SHA-256 of canonical document JSON>",
+  "document": {"format": "editable-room/1", "label": "Example", "objects": []}
+}
+```
+
+The empty object array above describes the envelope only; actual room validation requires at least one object. Canonical JSON is UTF-8, sorted keys, compact separators, finite numbers, as defined by `contracts.canonical`. `OfficialCodexRunner.result` verifies task identity, input digest, document digest and schema. The authenticated gateway must additionally bind the task to the job/owner and reject wrong-task/replayed writes. No binary artifact return, direct ZIP upload or model-selection flag is assumed from Cloud.
+
+The HTTP app takes a trusted `authenticate(environ) -> Principal` dependency. Default is deny-all. Production middleware must verify its own session/signature and derive the owner and permissions server-side; never trust client owner headers. `can_model` is explicit spend authority and `can_publish` is publication authority. A read-only Site visitor is not granted either. Current reads are owner-only; shared visitor ACLs belong in the approved Site adapter. TLS termination and production WSGI hosting are deployment work, not configured here. Browser mutations require same-origin requests and JSON; no CORS is enabled. Responses use `no-store` and a same-origin content policy. Do not expose SQLite, service source, logs or an unprotected static copy of the viewer.
+
+| API | Behavior |
+| --- | --- |
+| `GET /v1/capabilities` | Current mode and principal permissions; no spend |
+| `GET /v1/rooms/{roomID}` | Owned workflow snapshot; no spend |
+| `POST /v1/rooms/{roomID}/commands` | JSON command with durable opaque `id` and `kind` |
+| `POST /v1/rooms/{roomID}/advance` | Explicit authorized worker tick; body `{}`; may submit a queued job or resume publication |
+| `GET /v1/rooms/{roomID}/published` | Only last acknowledged approved revision; owner authorization required |
+
+Commands are `model` + `scanID`, `edit` + `baseRevisionID` + `document`, `approve` + `revisionID`, or `publish` + `revisionID`. Unknown fields are rejected. A request ID is unique per owner across rooms and binds the entire command; repeat it after transport failure. Changing the payload under that ID yields a conflict. After a definitive failed model job, a new user intent uses a new ID; a replay of the old request cannot launch another job.
+
+## Failure and retention behavior
+
+SQLite claims the job before invoking the official client. Cloud has no proven submit idempotency key, so process death after claim or ambiguous submit output leaves `submitting`/`reconciling`. Automatic retries never submit it again. An operator must use the official Cloud UI/list to verify owner, environment and job correlation, then bind the existing task through the non-HTTP `reconcile` hook. Do not clear unknown submissions merely to make the UI progress. Known running tasks can be polled safely; unrecognized CLI output is not treated as completion. Invalid output cannot replace a valid revision.
+
+A Site publisher must be idempotent by publication request ID. Stage immutable revision data, verify protected asset access and viewer health, then conditionally advance its pointer from the expected previous revision. Return acknowledgement only after verification. Ambiguous errors retain `publishing`; retry the same ID. The local pointer moves only after acknowledgement. Keep old data until a separately approved retention action. There are no automatic deletion or rollback-to-empty operations.
+
+The mobile cache persists the pending command before transmission. Lost responses and app termination replay that same ID; corrupt caches surface errors instead of silently resetting history. The synthetic journal lives under Application Support/ModelWorkflows, independent of Documents/Houses. The existing scan deletion actions are unchanged. A future live adapter needs account-scoped local caches and a separately designed deletion/retention policy before handling private model artifacts.
+
+## Local synthetic validation
+
+```sh
+npm ci
+npm run test:workflow
+npm run build
+npm run build:private-viewer
+PYTHONPATH=apps/model-service python3 -m model_service --synthetic
+```
+
+Open `http://127.0.0.1:8787/?room=demo`, login `demo` / `synthetic-only`. This intentionally public demo password only protects a loopback synthetic fixture; it is not production authentication. State is temporary and deleted when the harness exits. No Cloud client or Site API is called. The private viewer must be served through this authenticated application; Vite/static hosting alone is not a protection boundary.
+
+On a Mac, run the Foundation-only persistence checks:
+
+```sh
+swiftc apps/house-capture/HouseCapture/ModelWorkflow.swift \
+  apps/house-capture/HouseCapture/ModelWorkflowSelfTest.swift \
+  tools/test-model-workflow.swift -o /tmp/test-model-workflow
+/tmp/test-model-workflow
+```
+
+`-selftest` includes these regressions and the existing camera crash-fix checks. `-workflow-demo` and `-workflow-gated` are Debug-only launch views. `-workflow-demo-id <unique-id>` isolates synthetic UI runs. Generate the Xcode project and run the `HouseCapture` scheme's `HouseCaptureWorkflowUITests` on an iOS simulator. These test app interruption, editing, approval, local publication, reopening, and live setup gates without camera use. CI runs Python tests, TypeScript and both viewer builds; iOS verification requires Xcode.
+
+## iPhone acceptance next
+
+No physical device is installed, reset or scanned by this change. Preserve the existing crash-fix build 1.0(2) and its saved rooms. After an authorized in-place test-build upgrade (never an uninstall/reset), first compare saved room/session/history counts, inspect existing scans, open Model & publish and confirm the Cloud/Site setup messages, then test the **synthetic** workflow, including leaving/reopening, editing, approving and local publication. Camera scanning and live private reconstruction remain separate gates. Keep the feature draft PR unmerged until the user completes that testing and explicitly authorizes merge.
+
+## Official interface evidence
+
+Verified against the installed CLI's help and [official Codex source at 970111f](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/cloud-tasks/src/lib.rs). The source confirms that non-ready `cloud status` results exit 1, so the adapter parses recognized status labels instead of treating every nonzero exit as a transport failure. This is source/interface evidence, not a successful live reconstruction.
