@@ -5,6 +5,10 @@ export type V3 = [number, number, number];
 
 /** A rebuilt room, ready to drop into the viewer (or the capture page) */
 export interface BuiltRoom {
+  /** Present only for an unfinished local raw capture preview. */
+  previewNote?: string;
+  /** Optional source label for a local authored reconstruction. */
+  previewSourceLabel?: string;
   layout?: RoomLayout;
   group: THREE.Group;
   lights: THREE.Group;
@@ -72,6 +76,8 @@ export interface PhotoPose {
 }
 
 export interface RoomModule {
+  /** Local scan previews do not support authored-room interaction or physics. */
+  previewOnly?: boolean;
   id: string;
   label: string;
   build(): Promise<BuiltRoom>;

@@ -1,3 +1,4 @@
+import { viewerModeForRoom, type ViewerMode } from './preview-policy';
 import { appURL } from './asset-base';
 import { collectInventory, showKnolling, stopKnolling } from './knolling';
 import { showLayout } from './layout';
@@ -12,7 +13,7 @@ import { updateCameraDepth } from '../../../packages/room-runtime/camera-depth';
 import { setMaxAnisotropy } from '../../../packages/room-runtime/materials';
 import { applyRoomRendering, createPipeline, precompileRoomRendering } from '../../../packages/room-runtime/render';
 
-document.querySelector('.play-link')!.addEventListener('click', () => { location.href = appURL('play.html') + location.search; });
+document.querySelector('.play-link')!.addEventListener('click', () => { if (roomById(roomId).previewOnly) return; location.href = appURL('play.html') + location.search; });
 
 const EYE_HEIGHT = 1.6;
 const WALK_SPEED = 1.5; // m/s
@@ -141,7 +142,7 @@ async function loadRoom(id: string, updated?: RoomModule) {
   const mod = updated ?? roomById(id);
   if (mod.id === roomId && !updated) return;
   if (updated) { saveLiveView(); built.delete(mod.id); }
-  if (mode === 'walk') setMode('orbit');
+  if (mode === 'walk' || viewerModeForRoom(mod.previewOnly, mode) !== mode) setMode('orbit');
   roomId = mod.id;
   const request = ++roomRequest;
   if (!room) loaderEl.classList.remove('done');
@@ -185,6 +186,19 @@ async function loadRoom(id: string, updated?: RoomModule) {
   referenceEpoch++;
   room = next;
   activeRoomId = mod.id;
+  let previewNote = document.querySelector<HTMLElement>('#scan-preview-note');
+  if (!previewNote) {
+    previewNote = document.createElement('p');
+    previewNote.id = 'scan-preview-note';
+    previewNote.style.cssText = 'margin:12px 16px;padding:12px;border:1px solid #647868;border-radius:8px;font-size:12px;line-height:1.5;color:#dce6d8';
+    hud.prepend(previewNote);
+  }
+  previewNote.textContent = next.previewNote ?? '';
+  previewNote.hidden = !next.previewNote;
+  hud.querySelector<HTMLButtonElement>('[data-source=model]')!.textContent = next.previewSourceLabel ?? (next.previewNote ? 'Raw scan' : 'Rebuilt');
+  for (const selector of ['[data-mode=knolling]', '[data-mode=walk]', '.play-link']) {
+    hud.querySelector<HTMLButtonElement>(selector)!.disabled = Boolean(next.previewNote);
+  }
   transition = undefined;
   movingRatio = Math.min(window.devicePixelRatio, 1);
   slowFrames = fastFrames = 0;
@@ -198,7 +212,7 @@ async function loadRoom(id: string, updated?: RoomModule) {
   orbit.maxDistance = mod.id === 'house' ? 80 : 30;
   collectInventory(room);
   room.optimize?.({ static: true });
-  if (mode !== 'layout' && mode !== 'knolling' && !['layout', 'knolling'].includes(new URLSearchParams(location.search).get('view') ?? '')) await prepareRendering();
+  if (mode !== 'layout' && mode !== 'knolling') await prepareRendering();
   if (request !== roomRequest) { releaseReplaced(); return; }
 
   if (room.layout) showLayout(layoutHost, room.layout, mod.label);
@@ -313,12 +327,14 @@ async function setSource(next: Source, force = false) {
 
 // --- Navigation modes ------------------------------------------------------
 
-type Mode = 'orbit' | 'walk' | 'layout' | 'knolling';
+type Mode = ViewerMode;
 let mode: Mode = 'orbit';
 const savedOrbit = { position: new THREE.Vector3(), target: new THREE.Vector3() };
 
 function setMode(next: Mode) {
-  if (next === mode || !room || (next === 'layout' && !room.layout)) return;
+  if (!room) return;
+  next = viewerModeForRoom(roomById(roomId).previewOnly, next);
+  if (next === mode || (next === 'layout' && !room.layout)) return;
   transition = undefined;
   keys.clear();
   walkVelocity.set(0, 0);
@@ -661,7 +677,12 @@ if (import.meta.hot) {
 await loadRoom(new URLSearchParams(location.search).get('room') ?? ROOMS[0].id);
 
 const initialView = new URLSearchParams(location.search).get('view');
-if (initialView === 'layout' || initialView === 'knolling') setMode(initialView);
+if (initialView === 'layout' || initialView === 'knolling' || initialView === 'walk') {
+  setMode(initialView);
+  if (roomById(roomId).previewOnly && initialView !== 'layout') {
+    const url = new URL(location.href); url.searchParams.set('view', 'orbit'); history.replaceState(null, '', url);
+  }
+}
 else restoreCameraLink();
 updateCameraHelper();
 

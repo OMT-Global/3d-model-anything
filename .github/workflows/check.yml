@@ -14,6 +14,7 @@ jobs:
       - run: python3 tools/audit-public.py
       - run: npm ci
       - run: npm run build
+      - run: npm run test:local-previews
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
