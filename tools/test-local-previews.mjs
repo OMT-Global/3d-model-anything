@@ -65,6 +65,21 @@ try {
     cutaway.group.children[1].geometry.getAttribute('position'), 'cutaway shares transformed attributes');
   await server.close(); server = undefined;
   globalThis.fetch = originalFetch; GLTFLoader.prototype.loadAsync = originalLoad;
+  // A private authored module must not be resolved or emitted by production.
+  const privateModule = join(fixture, 'data/scans/synthetic-private-scene.ts');
+  await writeFile(privateModule, `export const privateModel = '${marker}';`);
+  await writeFile(manifest, JSON.stringify([{ id: marker, module: '/@fs/' + privateModule, label: marker }]));
+  await build({ configFile, logLevel: 'error' });
+  const authoredOutput = join(fixture, 'apps/room-viewer/dist');
+  async function checkAuthored(directory) {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      assert.ok(!entry.name.includes('synthetic-private'), 'authored private output filename');
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) await checkAuthored(path);
+      else assert.ok(!(await readFile(path)).includes(Buffer.from(marker)), 'authored private output content');
+    }
+  }
+  await checkAuthored(authoredOutput);
   // Malformed private metadata proves production never reads/parses it.
   await writeFile(manifest, marker + '{invalid json');
   await build({ configFile, logLevel: 'error' });

@@ -195,7 +195,7 @@ async function loadRoom(id: string, updated?: RoomModule) {
   }
   previewNote.textContent = next.previewNote ?? '';
   previewNote.hidden = !next.previewNote;
-  hud.querySelector<HTMLButtonElement>('[data-source=model]')!.textContent = next.previewNote ? 'Raw scan' : 'Rebuilt';
+  hud.querySelector<HTMLButtonElement>('[data-source=model]')!.textContent = next.previewSourceLabel ?? (next.previewNote ? 'Raw scan' : 'Rebuilt');
   for (const selector of ['[data-mode=knolling]', '[data-mode=walk]', '.play-link']) {
     hud.querySelector<HTMLButtonElement>(selector)!.disabled = Boolean(next.previewNote);
   }

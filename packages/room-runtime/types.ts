@@ -7,6 +7,8 @@ export type V3 = [number, number, number];
 export interface BuiltRoom {
   /** Present only for an unfinished local raw capture preview. */
   previewNote?: string;
+  /** Optional source label for a local authored reconstruction. */
+  previewSourceLabel?: string;
   layout?: RoomLayout;
   group: THREE.Group;
   lights: THREE.Group;

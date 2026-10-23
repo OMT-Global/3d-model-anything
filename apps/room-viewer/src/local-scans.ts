@@ -2,12 +2,17 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import type { BuiltRoom, RoomLayout, RoomModule } from '../../../packages/room-runtime/types';
 
-type Entry = { id: string; label: string; mesh: string; measurements: string; note: string };
+type Entry = { id: string; label: string; mesh: string; measurements: string; note: string; module?: string };
 // The Vite plugin exposes private metadata only to the localhost dev server.
 import entries from 'virtual:local-scans';
 export const localScans: RoomModule[] = (entries as Entry[]).map(entry => ({
   id: entry.id, label: entry.label, previewOnly: true,
   async build(): Promise<BuiltRoom> {
+    if (entry.module) {
+      if (!import.meta.env.DEV) throw new Error('Local scene modules are development-only');
+      if (!entry.module.startsWith('/@fs/')) throw new Error('Local scene modules require an absolute local file URL');
+      return (await import(/* @vite-ignore */ entry.module)).build();
+    }
     const response = await fetch(entry.measurements);
     if (!response.ok) throw new Error(`Scan measurements: HTTP ${response.status}`);
     const data = await response.json();
