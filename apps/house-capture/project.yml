@@ -9,7 +9,7 @@ settings:
   base:
     SWIFT_VERSION: "5.0"
     MARKETING_VERSION: "1.0"
-    CURRENT_PROJECT_VERSION: "1"
+    CURRENT_PROJECT_VERSION: "3"
 targets:
   HouseCapture:
     type: application
@@ -25,6 +25,7 @@ targets:
       path: HouseCapture/Info.plist
       properties:
         CFBundleDisplayName: 3D Model Anything
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         NSCameraUsageDescription: 3D Model Anything uses the camera and LiDAR scanner to measure your rooms and take reference photos.
         # Non-LiDAR devices can import and review scans; capture is checked at runtime.
         ITSAppUsesNonExemptEncryption: false
@@ -38,3 +39,21 @@ targets:
         UIStatusBarHidden: false
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
         UISupportedInterfaceOrientations~ipad: [UIInterfaceOrientationPortrait, UIInterfaceOrientationPortraitUpsideDown]
+
+  HouseCaptureWorkflowUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [WorkflowUITests]
+    dependencies:
+      - target: HouseCapture
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: com.wesbos.housecapture.workflow-tests
+schemes:
+  HouseCapture:
+    build:
+      targets:
+        HouseCapture: all
+    test:
+      targets: [HouseCaptureWorkflowUITests]

@@ -30,6 +30,7 @@ struct FieldworkRoomScreen: View {
                 .font(.system(.caption, design: .monospaced)).foregroundStyle(Fieldwork.secondary)
             }
           }
+          RoomWorkflowEntry(roomID: room.id)
           if let active = room.active, let session = house.session(active.session) {
             FieldworkRoomPreview(source: source(house, room, session, active))
               .id("\(active.session)/\(active.index)")

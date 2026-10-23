@@ -1,6 +1,6 @@
 {
   "title": "Privacy policy",
-  "updated": "October 7, 2026",
+  "updated": "October 23, 2026",
   "sections": [
     {
       "title": "Your scans stay under your control",
@@ -25,6 +25,10 @@
     {
       "title": "Imported scans and temporary exports",
       "body": "When you import a folder, the app copies its room data into local storage. The original folder remains where you selected it. Temporary ZIP files are used to prepare shares and are removed after the share sheet closes; abandoned temporary shares are cleaned up later."
+    },
+    {
+      "title": "Synthetic modeling preview",
+      "body": "The Model & publish preview is not connected to Codex Cloud or ChatGPT Sites. Its synthetic demo uses a fixed sample room without reading or uploading your scans. Demo jobs, model revisions and local publication state are saved separately in Application Support on your device and may be included in device backups. No remote credentials are created or stored by this preview."
     },
     {
       "title": "Changes and support",

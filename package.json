@@ -7,7 +7,9 @@
     "dev": "vite --config apps/room-viewer/vite.config.ts",
     "build": "tsc && vite build --config apps/room-viewer/vite.config.ts",
     "preview": "vite preview --config apps/room-viewer/vite.config.ts",
-    "textures": "python3 .agents/skills/scan-to-threejs/scripts/fetch_textures.py"
+    "textures": "python3 .agents/skills/scan-to-threejs/scripts/fetch_textures.py",
+    "test:workflow": "python3 -m unittest discover -s apps/model-service/tests -v",
+    "build:private-viewer": "tsc && vite build --config apps/protected-viewer/vite.config.ts"
   },
   "dependencies": {
     "@dimforge/rapier3d-compat": "^0.20.0",
