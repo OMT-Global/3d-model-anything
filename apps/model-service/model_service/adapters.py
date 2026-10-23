@@ -19,7 +19,10 @@ class GatedPublisher:
 
 
 class OfficialCodexRunner:
-    """Only instantiate after separately scoped deployment/auth/transfer approval.
+    """Production needs separately scoped deployment/auth/transfer approval.
+
+    An operator may prove synthetic jobs with existing authorized local client access.
+    That proof does not connect the phone or authorize private scan transfer.
 
     The official binary owns ChatGPT subscription authentication. These calls do not
     create credentials, select a model, upload ZIPs, apply patches or execute output.

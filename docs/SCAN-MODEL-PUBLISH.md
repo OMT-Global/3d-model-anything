@@ -8,7 +8,7 @@ This branch builds on the camera white-balance fix in PR #3 (`c155dbc`). Its dra
 - **Model:** the iOS screen shows the Cloud setup gate. A separately labeled, on-device synthetic workflow demonstrates durable job progress, reopening, an editable 3D model, and immutable revisions. It never reads a user's scan. Room/object labels, sample-table position, width and material are editable. The deliberately small `editable-room/1` format supports boxes; this is a foundation for reconstruction, not a claim of photo-realistic modeling.
 - **Publish:** the user approves one exact immutable revision, then explicitly publishes. The synthetic app stores a local publication only. Editing creates a new unapproved revision; earlier revisions and the previous publication remain available.
 - **Portable service:** standard-library Python with SQLite implements authenticated owner-scoped commands, durable idempotency, progress, revision approval, and publication recovery. It runs on Linux; no runtime Mac relay or Apple framework is needed.
-- **Official-client integration:** `OfficialCodexRunner` invokes the installed official `codex cloud exec/status` client with one attempt, an explicit environment and branch. Prompt input goes over stdin. Official ChatGPT subscription auth remains inside that client. This adapter is implemented and tested against process fixtures, **not validated by starting a live Cloud job**.
+- **Official-client integration:** `OfficialCodexRunner` invokes the installed official `codex cloud exec/status` client with one attempt, an explicit environment and branch. Prompt input goes over stdin. Official ChatGPT subscription auth remains inside that client. This adapter has process-fixture coverage and a restartable synthetic Cloud proof harness using official `cloud diff` to retrieve bounded JSON. Authentication and environment discovery have been exercised against the real client; **no live reconstruction job has completed** because this repository has no configured Cloud environment.
 - **Private viewer template:** a separate Three.js build reads only the authenticated user's published revision. The service authenticates HTML, JS, model data and all asset routes; it denies access by default. It is not added to GitHub Pages or the public demo bundle.
 
 ## Deliberate live gates
@@ -27,6 +27,53 @@ Before enabling live use, separately scope and approve:
 | iOS / app authorization | Supply short-lived app credentials and account binding through an approved login flow, then connect `RemoteWorkflowTransport` and private scan selection. Codex credentials must never be supplied to the phone. | No new credentials or persistent access created. |
 
 No integration should declare itself live simply because its configuration values are present. Start with a synthetic live task after these gates are approved, then obtain explicit approval before using private scans.
+
+## Real-client synthetic proof (operator tool, not the mobile service)
+
+On 2026-10-23 the installed official `codex-cli 0.164.0` reported ChatGPT login, and `codex cloud list --json` succeeded using that existing access. The official client's repository lookup returned zero environments for `OMT-Global/3d-model-anything` and its upstream. The environment selector contained no matching label; explicit `cloud list --env OMT-Global/3d-model-anything` returned environment not found. No other repository's environment was substituted. No Cloud task was submitted, so there is **no live task ID or verified Cloud model artifact** to report.
+
+`model_service.cloud_smoke` provides the next permitted test once a repository-specific environment is available. It sends only a fixed public synthetic measurement fixture in the prompt, requests four measured boxes as `editable-room/1`, and attempts to retrieve a single new JSON file through official `codex cloud diff --attempt 1`. It never runs `cloud apply`, executes generated code, commits generated output, uploads files, or accepts private input. This use of a task diff is restricted to the built-in synthetic fixture and is **not** the private scan/output gateway.
+
+**Unproven output boundary:** a workspace change or `git add -N` does not guarantee that Cloud persists a result diff. The official CLI only reads the backend-provided diff; [upstream issue #51289](https://github.com/openai/codex/issues/51289) reports READY tasks with no serialized diff. This harness is an experiment to verify that boundary, not a guaranteed artifact transport. Missing or unreadable diffs leave the same task unverified with no revision and no resubmission; later polls can recover if the artifact becomes available. Local Git-diff fixtures test parsing only. Production artifact transport remains gated until a supported private result contract is established.
+
+The importer checks the exact result path, regular-file mode, complete single-file diff, bounded size, duplicate JSON keys, job ID, input digest, document schema, and independently computed geometry. Retrieval is bound to the durable task ID. Only a verified model creates a revision, initially unapproved. Existing model schema is intentionally limited to boxes; a synthetic pass does not prove visual reconstruction quality for real rooms.
+
+Run from the repository with an explicit, approved environment ID and branch. The state directory must be outside any Git checkout, owned by the operator with mode 0700 and no symlinked journal/log files under trusted parent directories: the official client can emit an `error.log` containing account/environment metadata. Keep that journal and log local; do not publish them.
+
+```sh
+# Keep this value for all commands and restarts; a new directory is a new run.
+PROOF_DIR="$(mktemp -d)"
+
+# Inspect the exact public prompt; makes no network request.
+PYTHONPATH=apps/model-service python3 -m model_service.cloud_smoke plan \
+  --state-dir "$PROOF_DIR" --environment APPROVED_ENV_ID \
+  --branch feat/scan-model-publish
+
+# Read-only auth/environment check. A failure reserves no job.
+PYTHONPATH=apps/model-service python3 -m model_service.cloud_smoke check \
+  --state-dir "$PROOF_DIR" --environment APPROVED_ENV_ID \
+  --branch feat/scan-model-publish
+
+# Explicitly spends existing subscription usage: one Cloud task, one attempt.
+PYTHONPATH=apps/model-service python3 -m model_service.cloud_smoke submit \
+  --state-dir "$PROOF_DIR" --environment APPROVED_ENV_ID \
+  --branch feat/scan-model-publish
+
+# Repeat as needed; poll cannot submit work. show makes no network request.
+PYTHONPATH=apps/model-service python3 -m model_service.cloud_smoke poll \
+  --state-dir "$PROOF_DIR" --environment APPROVED_ENV_ID \
+  --branch feat/scan-model-publish
+```
+
+Keep the same state directory, environment and branch across restarts. `submit` returns an existing job rather than creating another; only a known, unclaimed queued job can resume submission. Unknown submission outcomes remain blocked. An operator may use `reconcile --verified-task-id task_...` only after verifying the task's environment, branch and prompt job correlation in the official UI. An incorrect binding cannot import a result with a different job ID or input digest. A new state directory represents a new spend intent, not a retry. The tool deliberately has no automatic retry or new-attempt command.
+
+The test's successful output requires `verified: true`, an actual Cloud task ID, and a validated revision document/digest. A submitted or READY task alone is insufficient. `phoneConnected` and `publicationEnabled` remain false. Local mocked tests exercise this lifecycle but are not live Cloud evidence. The real preflight executed here returned `cloud_environment_unavailable`, with empty jobs/revisions and `verified: false`.
+
+**Minimum next user action:** sign into the existing ChatGPT account at the [official environment settings](https://chatgpt.com/codex/settings/environments), then inspect whether this public repository is selectable under the existing Codex GitHub connection. The browser currently redirects to sign-in; CLI login does not establish browser login. The GitHub plugin's repository access does not prove the Codex connection's scope. Therefore it is not yet verified whether setup needs only a private environment record or a new repository grant.
+
+If the repository is already available, propose one private environment for this repository, with no secrets, extra network access, purchase or publication, and verify its exact ID through the official CLI before a synthetic task. Current [environment documentation](https://developers.openai.com/codex/environments/cloud-environments) and the [legacy guide](https://developers.openai.com/codex/environments/cloud-environment) describe different setup experiences; compatibility with this installed CLI must be checked. If Connect GitHub, Configure access, new terms or billing appears, stop and scope the exact action separately. No environment-specific cost or terms were visible behind sign-in, and no claim of cost-free creation is made. The proposed test uses existing subscription allowance if supported; no new paid hosting is proposed. No environment or grant was created here.
+
+A completed operator CLI proof would establish the official Cloud execution/result boundary only. Phone-driven production still needs an approved non-Mac launcher, app account/spend authorization and secure private transfer. This change neither configures those resources nor alters the installed iPhone build. Sites stays separately gated.
 
 ## Data and transport contract
 
@@ -95,8 +142,8 @@ swiftc apps/house-capture/HouseCapture/ModelWorkflow.swift \
 
 ## iPhone acceptance next
 
-No physical device is installed, reset or scanned by this change. Preserve the existing crash-fix build 1.0(2) and its saved rooms. After an authorized in-place test-build upgrade (never an uninstall/reset), first compare saved room/session/history counts, inspect existing scans, open Model & publish and confirm the Cloud/Site setup messages, then test the **synthetic** workflow, including leaving/reopening, editing, approving and local publication. Camera scanning and live private reconstruction remain separate gates. Keep the feature draft PR unmerged until the user completes that testing and explicitly authorizes merge.
+The separately authorized in-place upgrade to 1.0(3) was installed and launched successfully, with the saved scan index and file inventory verified intact after a private local backup. The user has tried the synthetic workflow. This Cloud integration follow-up does not reinstall or interrupt that app. Its live Model/Site setup gates remain visible until the remote service and app authorization are actually connected. Camera scanning and private reconstruction remain separate gates. Keep the feature draft PR unmerged until the user completes testing and explicitly authorizes merge.
 
 ## Official interface evidence
 
-Verified against the installed CLI's help and [official Codex source at 970111f](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/cloud-tasks/src/lib.rs). The source confirms that non-ready `cloud status` results exit 1, so the adapter parses recognized status labels instead of treating every nonzero exit as a transport failure. This is source/interface evidence, not a successful live reconstruction.
+Verified against the installed CLI's help and [official Codex source at 970111f](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/cloud-tasks/src/lib.rs). The source confirms that non-ready `cloud status` results exit 1, so the adapter parses recognized status labels instead of treating every nonzero exit as a transport failure. The current local official source (`a314c7d`) also confirms stdin prompts, explicit environment resolution and `cloud diff --attempt`. This is source/interface evidence plus authenticated read-only discovery, not a successful live reconstruction.
