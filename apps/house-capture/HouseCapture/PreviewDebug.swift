@@ -28,6 +28,13 @@ enum PreviewDebug {
   /// App entry: `if let preview = PreviewDebug.launchView() { preview } else { … }`
   @MainActor static func launchView() -> AnyView? {
     #if DEBUG
+    if let houseID = value("-connection-house"), let roomID = value("-connection-source"),
+       let house = try? HouseProject.load(id: houseID), let room = house.rooms.first(where: { $0.id == roomID }) {
+      if args.contains("-connection-openings") {
+        return AnyView(NavigationStack { ManualOpeningEditor(house: house, room: room, onChange: {}) })
+      }
+      return AnyView(NavigationStack { RoomConnection(house: house, source: room, onSave: {}) })
+    }
     // Open the real Fieldwork room screen against simulator fixtures for visual checks.
     if let houseID = value("-fieldwork-house"), let roomID = value("-fieldwork-room") {
       return AnyView(NavigationStack {
