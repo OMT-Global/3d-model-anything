@@ -78,7 +78,7 @@ struct CaptureScreen: View {
       }
     }
     .onChange(of: controller.phase) { old, next in
-      if old == .finishingRoom, next == .betweenRooms, controller.reviewSource != nil, !controller.captureBudget.constrained { reviewing = true }
+      if !controller.pilot, old == .finishingRoom, next == .betweenRooms, controller.reviewSource != nil, !controller.captureBudget.constrained { reviewing = true }
     }
     .onAppear { controller.begin() }
     .onChange(of: scenePhase) { _, phase in
@@ -174,7 +174,10 @@ struct CaptureScreen: View {
           Label("Scan ended", systemImage: "exclamationmark.triangle.fill").font(.headline)
           Text("The phone lost its position. The available room data has been saved. Finish this session, then start a new capture from the house screen.")
             .font(.subheadline)
-          roomList
+          if controller.pilot {
+            ScrollView { roomList }
+              .frame(maxHeight: 180)
+          } else { roomList }
           Button("Finish and keep saved rooms") { Task { await controller.finishSession() } }
             .buttonStyle(.borderedProminent)
         }
@@ -200,6 +203,21 @@ struct CaptureScreen: View {
 
   private var betweenRooms: some View {
     panel {
+      if controller.pilot {
+        PilotCapturePanel {
+          betweenRoomContent
+        } actions: {
+          betweenRoomActions
+        }
+      } else {
+        betweenRoomContent
+        betweenRoomActions
+      }
+    }
+  }
+
+  private var betweenRoomContent: some View {
+    VStack(alignment: .leading, spacing: 12) {
       if controller.rooms.isEmpty {
         if controller.alignment.method == "relocalized" {
           Text("You're lined up with \(controller.zoneName). The faint green is what you scanned before\(controller.priorPhotoCount > 0 ? "; surfaces its \(controller.priorPhotoCount) photos already cover start out green" : ""). Scan a new room, or rescan one to replace it.")
@@ -216,15 +234,27 @@ struct CaptureScreen: View {
           Text("\(last.name): \(last.photographedPercent.map { "\($0)% photo detail" } ?? "not measured") · \(last.detailPhotos ?? 0) photos\(last.mesh == nil ? " · no mesh" : "")")
             .font(.footnote)
         }
-        Button("Review saved room in 3D") { reviewing = true }.buttonStyle(.borderedProminent)
-        Text("Inspect the textured scan before leaving. Use coverage colours in the preview to check gaps.").font(.caption)
+        if !controller.pilot { Button("Review saved room in 3D") { reviewing = true }.buttonStyle(.borderedProminent)
+        Text("Inspect the textured scan before leaving. Use coverage colours in the preview to check gaps.").font(.caption) }
+        else { Text("Room saved. Review textures after finishing the session; heavy reconstruction is deferred to the Mac.").font(.caption) }
         roomList
         Text("Walk into the next room, then start it. Stay in this session so the rooms line up.")
           .font(.footnote)
           .foregroundStyle(.secondary)
       }
+      if CapturePilot.available {
+        if !controller.captureStarted {
+          Toggle("Experimental whole house · one continuous session", isOn: $controller.experimentalHouse)
+          if controller.pilot { Stepper("Room limit: \(controller.pilotRoomLimit)", value: $controller.pilotRoomLimit, in: 4...21) }
+        }
+        if controller.pilot {
+          Text("\(controller.rooms.count)/\(controller.pilotRoomLimit) rooms · same AR session").font(.headline)
+          Text("Experimental: no automatic split or reset between rooms. ARKit map memory and drift can still grow. Tracking, heat, storage or writer failures can stop capture before 21 rooms. Live photo detail covers only the recent mesh; evidence is retained on disk.").font(.caption)
+          if controller.rooms.count >= 4 { Text("Past the baseline four-room guardrail. Continue only while tracking is stable.").font(.caption.weight(.bold)).foregroundStyle(.orange) }
+        }
+      }
       if controller.requiresFreshScan {
-        Text("This scan is saved. Finish this session, then tap Scan a room to continue with a fresh capture.").font(.headline)
+        Text(controller.pilot ? "The configured \(controller.pilotRoomLimit)-room experimental limit is reached. Finish and save this session. A new session has a separate tracking frame." : "This scan is saved. Finish this session, then tap Scan a room to continue with a fresh capture.").font(.headline)
       }
       Text("Which room are you in?").font(.subheadline.weight(.semibold))
       TextField("Room name", text: $controller.roomName)
@@ -261,8 +291,14 @@ struct CaptureScreen: View {
       }
       Toggle("High-resolution automatic photos", isOn: $controller.highResolutionPhotos)
         .font(.subheadline)
+      if controller.pilot { Text(controller.highResolutionStatus).font(.caption).foregroundStyle(.orange) }
       Text("Regular photos use camera frames for a lighter scan. High-resolution photos add processing and are limited to one request every 3 seconds while the phone is cool. The shutter always saves a regular photo.")
         .font(.caption).foregroundStyle(.secondary)
+    }
+  }
+
+  private var betweenRoomActions: some View {
+    VStack(alignment: .leading, spacing: 12) {
       Button {
         controller.startRoom()
       } label: {
@@ -274,7 +310,7 @@ struct CaptureScreen: View {
       .disabled(!controller.canStartRoom)
       if !controller.rooms.isEmpty {
         HStack {
-          Button("Redo last room", role: .destructive, action: controller.discardLastRoom)
+          if !controller.pilot { Button("Redo last room", role: .destructive, action: controller.discardLastRoom) }
           Spacer()
           Button("Finish session") { Task { await controller.finishSession() } }
             .buttonStyle(.bordered)
@@ -325,6 +361,10 @@ struct CaptureScreen: View {
 
   private var scanControls: some View {
     VStack(spacing: 10) {
+      if controller.pilot {
+        Text("Room \(controller.rooms.count + 1)/\(controller.pilotRoomLimit) · live mesh \(controller.pilotMeshAnchors) anchors / \(controller.pilotMeshBytes / 1_048_576) MB").font(.caption).foregroundStyle(.white)
+        tip(controller.highResolutionStatus)
+      }
       if controller.captureReady {
         tip(controller.quality.ready ? controller.quality.message : (controller.instruction ?? controller.quality.message))
         if controller.coveragePlateau && !controller.quality.ready {
@@ -371,6 +411,21 @@ struct CaptureScreen: View {
 
   private var done: some View {
     panel {
+      if controller.pilot {
+        PilotCapturePanel {
+          doneContent
+        } actions: {
+          Button("Close", action: onClose).buttonStyle(.borderedProminent)
+        }
+      } else {
+        doneContent
+        Button("Close", action: onClose).buttonStyle(.borderedProminent)
+      }
+    }
+  }
+
+  private var doneContent: some View {
+    VStack(alignment: .leading, spacing: 12) {
       Label("Saved", systemImage: "checkmark.seal.fill").font(.headline).foregroundStyle(.green)
       roomList
       HStack(spacing: 8) {
@@ -380,7 +435,6 @@ struct CaptureScreen: View {
       Text("Come back any time and tap **Scan a room**, or open a saved room and choose **Continue scanning from this room**. Share from the house screen (AirDrop the .zip to your Mac).")
         .font(.footnote)
         .foregroundStyle(.secondary)
-      Button("Close", action: onClose).buttonStyle(.borderedProminent)
     }
   }
 
@@ -399,6 +453,23 @@ struct CaptureScreen: View {
       .frame(maxWidth: 500)
       .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20))
       .padding(.horizontal)
+  }
+}
+
+/// Pilot room history and explanations scroll; Scan/Finish remain outside the scroll content.
+struct PilotCapturePanel<Content: View, Actions: View>: View {
+  @ViewBuilder var content: () -> Content
+  @ViewBuilder var actions: () -> Actions
+  var body: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      ScrollView {
+        content().frame(maxWidth: .infinity, alignment: .leading)
+      }
+      .frame(maxHeight: 360)
+      .scrollDismissesKeyboard(.interactively)
+      Divider()
+      actions().fixedSize(horizontal: false, vertical: true)
+    }
   }
 }
 

@@ -194,6 +194,7 @@ struct ScanBundle {
     manifest.worldMap = nil
     manifest.worldMapStatus = nil
     manifest.diagnostics = nil
+    manifest.capturePilot = nil // room-only exports omit the session journal
     try output.writeManifest(manifest)
   }
 
@@ -279,6 +280,7 @@ struct Manifest: Codable {
   var depthFrames: String?
   var depthFrameCount: Int?
   var diagnostics: Diagnostics?
+  var capturePilot: String? = nil
 }
 
 /// What the capture session actually did, for debugging bundles after the fact
@@ -341,6 +343,14 @@ struct Diagnostics: Codable {
     var coverageQueueDelayMS: Double?
     var pendingMeshUpdates: Int?
     var coalescedMeshUpdates: Int?
+    var peakMemoryMB: Double? = nil
+    var worldMapBytes: Int? = nil
+    var appMeshAnchors: Int? = nil
+    var appMeshBytes: Int? = nil
+    var scoringPhotos: Int? = nil
+    var pendingMeshBytes: Int? = nil
+    var depthWritesInFlight: Int? = nil
+    var skippedMeshUpdates: Int? = nil
   }
 
   struct Event: Codable {

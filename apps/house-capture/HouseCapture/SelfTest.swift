@@ -1,5 +1,6 @@
 import ARKit
 import SwiftUI
+import SceneKit
 import simd
 
 /// Launch with `-selftest` (works in the simulator): exercises everything of a multi-day
@@ -341,6 +342,7 @@ final class SelfTest {
     var houseID: String?
     do {
       try await coveragePerformance()
+      try await capturePilotPerformance()
       try roomJSONParsing()
       try connectionLandmarks()
       try manualOpeningsAndPlacement()
@@ -364,6 +366,259 @@ final class SelfTest {
     }
     log(failed == 0 ? "PASS \(passed)/\(passed)" : "FAILED \(failed) of \(passed + failed)")
     return failed == 0
+  }
+
+  private func capturePilotPerformance() async throws {
+    let mailbox = CoverageMailbox<Int, Data>()
+    mailbox.configure(maxCount: 2, maxCost: 10)
+    expect(mailbox.offerChecked(1, Data(repeating: 1, count: 6), cost: 6).accepted, "pilot mailbox accepts within byte budget")
+    expect(!mailbox.offerChecked(2, Data(repeating: 1, count: 6), cost: 6).accepted, "pilot mailbox rejects excess bytes without losing prior value")
+    expect(mailbox.offerChecked(1, Data(repeating: 2, count: 4), cost: 4).accepted, "pilot mailbox coalesces replacements within byte budget")
+    expect(mailbox.offerChecked(2, Data(repeating: 1, count: 6), cost: 6).accepted, "pilot mailbox replacement releases budget")
+    expect(!mailbox.offerChecked(3, Data(), cost: 0).accepted && mailbox.pendingCost == 10, "pilot mailbox independently bounds IDs")
+    expect(mailbox.take().count == 2 && mailbox.pendingCost == 0, "pilot mailbox drains accepted evidence and releases bytes")
+    for n in 0..<21 { expect(!CapturePilot.requiresFinish(completed: n, largeMap: true, experimental: true), "pilot room \(n + 1) permitted in one session") }
+    expect(CapturePilot.requiresFinish(completed: 21, largeMap: false, experimental: true), "pilot finishes at 21; never silently creates a replacement session")
+    expect(CapturePilot.requiresFinish(completed: 4, largeMap: false, experimental: false), "baseline retains four-room guardrail")
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("pilot-engine-\(UUID())")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    // The same depth payload has intentionally different baseline/pilot acceptance semantics.
+    let depth = Data(repeating: 0, count: 32)
+    let depthURL = root.appendingPathComponent("depth.f16z"), confidenceURL = root.appendingPathComponent("depth.conf")
+    try DepthRecorder.writeDepthPayload(depth, confidence: nil, depthURL: depthURL, confidenceURL: confidenceURL, strict: false)
+    expect(FileManager.default.fileExists(atPath: depthURL.path) && !FileManager.default.fileExists(atPath: confidenceURL.path),
+           "baseline depth still accepts a missing optional confidence map")
+    do {
+      try DepthRecorder.writeDepthPayload(depth, confidence: nil, depthURL: depthURL, confidenceURL: confidenceURL, strict: true)
+      expect(false, "pilot must reject incomplete depth evidence")
+    } catch { expect(true, "pilot rejects incomplete depth evidence before sidecar acceptance") }
+    let blocked = root.appendingPathComponent("not-a-directory")
+    try Data().write(to: blocked)
+    try DepthRecorder.writeDepthPayload(depth, confidence: Data([2]), depthURL: blocked.appendingPathComponent("depth"), confidenceURL: confidenceURL, strict: false)
+    expect(!FileManager.default.fileExists(atPath: blocked.appendingPathComponent("depth").path), "baseline depth retains best-effort behavior on write failure")
+    do {
+      try DepthRecorder.writeDepthPayload(depth, confidence: Data([2]), depthURL: blocked.appendingPathComponent("depth"), confidenceURL: confidenceURL, strict: true)
+      expect(false, "pilot depth must report a write failure")
+    } catch { expect(true, "pilot depth reports a write failure instead of accepting incomplete evidence") }
+
+    let overlayCache = PilotOverlayNodes(limit: 2), parent = SCNNode()
+    let ids = [UUID(), UUID(), UUID()], frameworkNodes = [SCNNode(), SCNNode(), SCNNode()]
+    for node in frameworkNodes {
+      node.geometry = SCNSphere(radius: 1)
+      let edges = SCNNode(); edges.name = "scan-triangles"; node.addChildNode(edges)
+      parent.addChildNode(node)
+    }
+    _ = overlayCache.node(for: ids[0]) { frameworkNodes[0] }
+    _ = overlayCache.node(for: ids[1]) { frameworkNodes[1] }
+    _ = overlayCache.node(for: ids[2]) { frameworkNodes[2] }
+    expect(overlayCache.count == 2 && frameworkNodes[0].geometry == nil && frameworkNodes[0].childNodes.isEmpty,
+           "pilot overlay eviction bounds app references and releases geometry")
+    expect(frameworkNodes.allSatisfy { $0.parent === parent } && parent.childNodes.count == 3,
+           "overlay eviction preserves framework-managed anchor containers")
+    let revisited = overlayCache.node(for: ids[0]) { frameworkNodes[0] }
+    revisited?.geometry = SCNSphere(radius: 0.5)
+    expect(revisited === frameworkNodes[0] && overlayCache.count == 2 && frameworkNodes[1].geometry == nil && parent.childNodes.count == 3,
+           "revisiting an evicted anchor reuses its framework container without duplicates")
+    overlayCache.remove([ids[0], ids[2]])
+    expect(overlayCache.count == 0 && frameworkNodes[0].geometry == nil && frameworkNodes[2].geometry == nil,
+           "room-boundary overlay removal clears all retained pilot geometry")
+    expect(overlayCache.node(for: UUID()) { nil } == nil && overlayCache.count == 0,
+           "missing framework node does not consume pilot overlay capacity")
+
+    var priorGate = PriorPhotoLoadGate()
+    expect(priorGate.request(allowed: false) == nil, "pilot mode does not request prior-photo coverage")
+    let firstPriorLoad = priorGate.request(allowed: true)!
+    expect(priorGate.request(allowed: true) == nil, "baseline opt-out requests prior photos without duplicating an in-flight load")
+    priorGate.invalidate() // switching back to pilot before the detached loader completes
+    expect(!priorGate.accept(firstPriorLoad, allowed: false), "stale baseline photo completion cannot populate pilot mode")
+    let secondPriorLoad = priorGate.request(allowed: true)!
+    expect(!priorGate.accept(firstPriorLoad, allowed: true), "older completion remains invalid after switching to baseline again")
+    expect(priorGate.accept(secondPriorLoad, allowed: true), "current baseline prior-photo completion is accepted")
+    expect(priorGate.request(allowed: true) == nil, "locking in baseline does not reload already accepted prior photos")
+    priorGate.invalidate()
+    expect(priorGate.request(allowed: false) == nil, "returning to pilot invalidates completed baseline photo state")
+
+    let photoMetricsEngine = CoverageEngine()
+    try photoMetricsEngine.beginPilotRoom(root: root.appendingPathComponent("photo-metrics-journal"), room: 0)
+    var photoOnlyMetrics = (anchors: -1, bytes: -1, photos: -1)
+    photoMetricsEngine.onPilotMetrics = { photoOnlyMetrics = ($0, $1, $2) }
+    let metricPhoto = CoverageEngine.Photo(worldToCamera: matrix_identity_float4x4, position: .zero,
+      fx: 1000, fy: 1000, cx: 960, cy: 720, width: 1920, height: 1440, sharpness: 1, room: 0)
+    func awaitPhotoMetricBarrier() async {
+      await withCheckedContinuation { c in photoMetricsEngine.measureQueueDelay { _ in c.resume() } }
+    }
+    photoMetricsEngine.add(metricPhoto)
+    await awaitPhotoMetricBarrier()
+    expect(photoOnlyMetrics.photos == 1 && photoOnlyMetrics.anchors == 0 && photoOnlyMetrics.bytes == 0,
+           "single photo publishes scoring metrics without a mesh update")
+    photoMetricsEngine.add(contentsOf: Array(repeating: metricPhoto, count: 100))
+    await awaitPhotoMetricBarrier()
+    expect(photoOnlyMetrics.photos == CapturePilot.maxPhotos, "batch photo addition publishes bounded scoring-photo count")
+    photoMetricsEngine.reset(photos: [metricPhoto, metricPhoto])
+    await awaitPhotoMetricBarrier()
+    expect(photoOnlyMetrics.photos == 2, "photo reset publishes new count without mesh input")
+    photoMetricsEngine.reset(photos: [])
+    await awaitPhotoMetricBarrier()
+    expect(photoOnlyMetrics.photos == 0, "clearing photos publishes zero scoring-photo count")
+
+    let baseline = CoverageEngine(), pilot = CoverageEngine()
+    try pilot.beginPilotRoom(root: root.appendingPathComponent("journal"), room: 0)
+    var liveCount = 0, liveBytes = 0, failure: String?
+    pilot.onPilotMetrics = { count, bytes, _ in liveCount = count; liveBytes = bytes }
+    pilot.onPilotFailure = { failure = $0 }
+    func flush(_ engine: CoverageEngine, _ name: String) async throws -> PLYMesh {
+      let path = root.appendingPathComponent(name)
+      let result = await withCheckedContinuation { c in engine.exportPLY(to: path) { c.resume(returning: $0) } }
+      _ = try result.get()
+      return try PLYMesh.load(url: path)
+    }
+    for batch in 0..<10 {
+      for i in 0..<10 {
+        let x = Float(batch * 10 + i)
+        let snapshot = ARMeshAnchor.Snapshot(id: UUID(), transform: matrix_identity_float4x4,
+          positions: [SIMD3(x,0,0), SIMD3(x+0.1,0,0), SIMD3(x,0.1,0)],
+          normals: Array(repeating: SIMD3(0,0,1), count: 3), faces: [0,1,2], classes: [1])
+        baseline.update(snapshot: snapshot); pilot.update(snapshot: snapshot)
+      }
+      _ = try await flush(pilot, "pilot.ply")
+    }
+    let a = try await flush(baseline, "baseline.ply"), b = try await flush(pilot, "pilot.ply")
+    expect(a.vertexCount == b.vertexCount && a.faceCount == b.faceCount && b.vertexCount == 300,
+           "pilot eviction preserves all 100 synthetic anchors in streamed export")
+    func points(_ mesh: PLYMesh) -> [String] { (0..<mesh.vertexCount).map { "\(mesh.position($0))" }.sorted() }
+    expect(points(a) == points(b), "baseline and disk-backed pilot export identical world geometry")
+    expect(liveCount == CapturePilot.maxAnchors && liveBytes <= CapturePilot.meshBytes && failure == nil,
+           "pilot live mesh is bounded while complete export exceeds cache")
+    log("pilot synthetic comparison: baseline 100 resident anchors vs pilot \(liveCount); estimated pilot mesh arrays \(liveBytes) bytes; geometry identical (not a device memory benchmark)")
+    let room0 = try Data(contentsOf: root.appendingPathComponent("pilot.ply"))
+    try pilot.beginPilotRoom(root: root.appendingPathComponent("journal"), room: 1)
+    let snapshot = ARMeshAnchor.Snapshot(id: UUID(), transform: matrix_identity_float4x4,
+      positions: [SIMD3<Float>(0,0,0), SIMD3(1,0,0), SIMD3(0,1,0)], normals: Array(repeating: SIMD3(0,0,1), count: 3), faces: [0,1,2], classes: [1])
+    pilot.update(snapshot: snapshot)
+    let second = try await flush(pilot, "second.ply")
+    let preservedRoom0 = try Data(contentsOf: root.appendingPathComponent("pilot.ply"))
+    expect(second.vertexCount == 3 && preservedRoom0 == room0,
+           "next room resets app working set without modifying earlier room evidence")
+    // Keep the real input mailbox pending deterministically, rather than relying on thread timing.
+    let transitionRoot = root.appendingPathComponent("transition-journal")
+    let transition = CoverageEngine(meshUpdateDelay: 10)
+    try transition.beginPilotRoom(root: transitionRoot, room: 0)
+    var delivered: [UUID] = []
+    var transitionMetrics: [(anchors: Int, bytes: Int, photos: Int)] = []
+    transition.onPilotMetrics = { transitionMetrics.append(($0, $1, $2)) }
+    transition.onMeshes = { delivered += $0.map(\.id) }
+    transition.update(snapshot: snapshot)
+    expect(transition.pendingMeshUpdates == 1, "room-transition fixture has an accepted undrained mesh snapshot")
+    try transition.beginPilotRoom(root: transitionRoot, room: 1)
+    let oldJournal = try PilotMeshJournal(root: transitionRoot, room: 0)
+    let newJournal = try PilotMeshJournal(root: transitionRoot, room: 1)
+    let previousEntries = try oldJournal.entries(), newEntries = try newJournal.entries()
+    expect(previousEntries.map(\.anchor) == [snapshot.id.uuidString] && newEntries.isEmpty && transition.pendingMeshUpdates == 0,
+           "room transition drains accepted geometry into previous journal before switching")
+    let emptyResult = await withCheckedContinuation { c in transition.exportPLY(to: root.appendingPathComponent("empty-next-room.ply")) { c.resume(returning: $0) } }
+    let emptyCounts = try emptyResult.get()
+    expect(emptyCounts.vertices == 0 && delivered.isEmpty,
+           "room transition clears stale render mailbox and does not leak old geometry into next room")
+    expect(transitionMetrics.contains { $0.anchors > 0 } && transitionMetrics.last?.anchors == 0 && transitionMetrics.last?.bytes == 0 && transitionMetrics.last?.photos == 0,
+           "room transition publishes zero pilot working-set metrics even with no new mesh input")
+    transition.update(snapshot: snapshot)
+    let transitionChunks = transitionRoot.appendingPathComponent("chunks")
+    try FileManager.default.moveItem(at: transitionChunks, to: root.appendingPathComponent("transition-preserved-chunks"))
+    try Data().write(to: transitionChunks)
+    do {
+      try transition.beginPilotRoom(root: transitionRoot, room: 2)
+      expect(false, "failed previous-room drain must stop transition")
+    } catch {
+      expect(!FileManager.default.fileExists(atPath: transitionRoot.appendingPathComponent("room-2").path),
+             "failed previous-room drain throws before creating or switching next journal")
+    }
+    try FileManager.default.removeItem(at: transitionChunks)
+    try FileManager.default.moveItem(at: root.appendingPathComponent("transition-preserved-chunks"), to: transitionChunks)
+    let recovered = try await flush(transition, "recovered-previous-room.ply")
+    let recoveredEntries = try newJournal.entries()
+    expect(recovered.vertexCount == 3 && recoveredEntries.count == 1,
+           "failed transition retains accepted evidence and previous journal for a later save")
+
+    let densePanel = PilotCapturePanel {
+      VStack(alignment: .leading, spacing: 12) {
+        Text("21/21 rooms · same AR session").font(.headline)
+        ForEach(1...21, id: \.self) { number in Text("✓ Room \(number) saved · 12 high-resolution photos") }
+        Text("Experimental limit reached. Finish and save this session.")
+      }
+    } actions: {
+      VStack(spacing: 12) {
+        Button("Room limit reached") {}.buttonStyle(.borderedProminent).disabled(true)
+        Button("Finish session") {}.buttonStyle(.borderedProminent)
+      }.frame(maxWidth: .infinity)
+    }
+    let previews = try await hostedPilotPanelSnapshots(densePanel.padding().background(Color.white).environment(\.colorScheme, .light))
+    expect(previews.top.size == CGSize(width: 393, height: 640) && previews.bottom.size == previews.top.size,
+           "dense 21-room pilot panel renders with a mounted scroll view and pinned actions")
+    for (name, image) in [("pilot-21-room-layout.png", previews.top), ("pilot-21-room-layout-bottom.png", previews.bottom)] {
+      if let png = image.pngData() {
+        let path = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+        try png.write(to: path)
+        log("pilot dense-layout hosted visual fixture: \(path.path)")
+      }
+    }
+
+    // Force a genuine write failure after initialization; the old exported file must survive.
+    let chunks = root.appendingPathComponent("journal/chunks")
+    try FileManager.default.moveItem(at: chunks, to: root.appendingPathComponent("preserved-chunks"))
+    try Data().write(to: chunks)
+    pilot.update(snapshot: snapshot)
+    let failedExport = await withCheckedContinuation { c in pilot.exportPLY(to: root.appendingPathComponent("second.ply")) { c.resume(returning: $0) } }
+    if case .failure = failedExport { expect(failure != nil, "journal failure is surfaced and export fails closed") }
+    else { expect(false, "journal failure must fail export") }
+    expect((try PLYMesh.load(url: root.appendingPathComponent("second.ply"))).vertexCount == 3,
+           "failed journal export preserves prior complete room mesh")
+  }
+
+  /// ImageRenderer does not reliably draw UIKit-backed ScrollView content offscreen.
+  /// Mount this synthetic fixture briefly, capture both scroll positions, then restore the app window.
+  private func hostedPilotPanelSnapshots<Content: View>(_ content: Content) async throws -> (top: UIImage, bottom: UIImage) {
+    guard let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first else {
+      throw CocoaError(.featureUnsupported, userInfo: [NSLocalizedDescriptionKey: "No window scene for hosted layout test"])
+    }
+    let previous = scene.windows.first { $0.isKeyWindow }
+    let window = UIWindow(windowScene: scene)
+    window.frame = CGRect(x: 0, y: 0, width: 393, height: 640)
+    window.windowLevel = .normal + 1
+    let host = UIHostingController(rootView: content)
+    host.view.backgroundColor = .white
+    window.rootViewController = host
+    window.makeKeyAndVisible()
+    defer {
+      window.isHidden = true
+      window.rootViewController = nil
+      previous?.makeKeyAndVisible()
+    }
+    host.view.setNeedsLayout()
+    host.view.layoutIfNeeded()
+    try await Task.sleep(for: .milliseconds(150)) // allow the mounted SwiftUI/UIKit hierarchy to render
+    host.view.layoutIfNeeded()
+    func scrollViews(in view: UIView) -> [UIScrollView] {
+      (view as? UIScrollView).map { [$0] } ?? view.subviews.flatMap { scrollViews(in: $0) }
+    }
+    guard let scroll = scrollViews(in: host.view).first(where: { $0.contentSize.height > $0.bounds.height + 1 }) else {
+      throw CocoaError(.featureUnsupported, userInfo: [NSLocalizedDescriptionKey: "Dense fixture did not mount an overflowing scroll view"])
+    }
+    func snapshot() throws -> UIImage {
+      let format = UIGraphicsImageRendererFormat(); format.scale = 1
+      var rendered = false
+      let image = UIGraphicsImageRenderer(size: window.bounds.size, format: format).image { _ in
+        rendered = window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
+      }
+      guard rendered else { throw CocoaError(.featureUnsupported) }
+      return image
+    }
+    let top = try snapshot()
+    let bottomOffset = max(-scroll.adjustedContentInset.top, scroll.contentSize.height - scroll.bounds.height + scroll.adjustedContentInset.bottom)
+    scroll.setContentOffset(CGPoint(x: scroll.contentOffset.x, y: bottomOffset), animated: false)
+    host.view.layoutIfNeeded()
+    try await Task.sleep(for: .milliseconds(100))
+    return (top, try snapshot())
   }
 
   private func coveragePerformance() async throws {
@@ -664,13 +919,14 @@ final class SelfTest {
     for path in ["worldmap.arworldmap", "structure.json", "structure.usdz"] { try Data([0]).write(to: source.file(path)) }
     try source.writeManifest(Manifest(createdAt: Date(), device: "test", systemVersion: "0", house: houseID, session: s1, zone: zone1.id,
                                       worldMap: "worldmap.arworldmap", rooms: roomRecords, structure: "structure.json", mesh: roomRecords[0].mesh,
-                                      photos: "photos/photos.json", photoCount: 2, depthFrames: "depth/frames.json", depthFrameCount: 2))
+                                      photos: "photos/photos.json", photoCount: 2, depthFrames: "depth/frames.json", depthFrameCount: 2, capturePilot: "pilot/session.json"))
     let exported = ScanBundle(url: exportTest.appendingPathComponent("export"))
     try source.exportRoom(index: 2, name: "Renamed room", to: exported.url)
     expect(exported.manifest?.rooms.map(\.index) == [2] && exported.manifest?.rooms.first?.name == "Renamed room", "room export preserves nonzero index and current name")
     expect(exported.photos.map(\.room) == [2] && exported.depthFrames.map(\.room) == [2], "room export filters photo and depth indexes")
     expect(exported.manifest?.photoCount == 1 && exported.manifest?.depthFrameCount == 1 && exported.manifest?.mesh?.file == "mesh/room-2.ply", "room export updates counts and mesh reference")
     expect(exported.manifest?.worldMap == nil && exported.manifest?.structure == nil, "room export clears session-wide references")
+    expect(exported.manifest?.capturePilot == nil, "room export does not reference an excluded pilot journal")
     for path in [photo.file, depth.file, depth.confidence, depth.rgb!, "rooms/room-2.json", "mesh/room-2.ply"] {
       expect(fm.fileExists(atPath: exported.file(path).path), "room export includes \(path)")
     }
