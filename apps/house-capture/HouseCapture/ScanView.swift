@@ -13,6 +13,7 @@ final class ScanView: NSObject, ARSCNViewDelegate {
   var onSessionFailure: (([Diagnostics.ErrorDetail]) -> Void)?
   var onSessionEvent: ((String) -> Void)?
   private var nodes: [UUID: SCNNode] = [:]
+  private let pilotOverlays = PilotOverlayNodes(limit: CapturePilot.maxAnchors)
   /// meshes that arrived before their node was registered
   private var waiting: [UUID: CoverageEngine.AnchorMesh] = [:]
   private let outline = SCNNode()
@@ -104,6 +105,12 @@ final class ScanView: NSObject, ARSCNViewDelegate {
     view.scene.rootNode.addChildNode(ghost)
     ghostEdges.renderingOrder = -4
     ghost.addChildNode(ghostEdges)
+    engine.onEvicted = { [weak self] ids in
+      guard let self else { return }
+      self.preparePilotOverlays()
+      self.pilotOverlays.remove(ids)
+      for id in ids { self.waiting[id] = nil }
+    }
     engine.onMeshes = { [weak self] meshes in self?.apply(meshes) }
   }
 
@@ -147,10 +154,16 @@ final class ScanView: NSObject, ARSCNViewDelegate {
   /// Hand every live mesh anchor to the engine again (after it wasn't fed for a while).
   /// Copying the buffers is heavy, so it happens off main; holding the anchors keeps them valid.
   func refeedEngine(from session: ARSession) {
-    let anchors = session.currentFrame?.anchors.compactMap { $0 as? ARMeshAnchor } ?? []
+    var anchors = session.currentFrame?.anchors.compactMap { $0 as? ARMeshAnchor } ?? []
+    if engine.pilotActive {
+      let camera = session.currentFrame?.camera.transform.columns.3 ?? SIMD4<Float>(0, 0, 0, 1)
+      anchors.sort { simd_distance($0.transform.columns.3, camera) < simd_distance($1.transform.columns.3, camera) }
+      anchors = Array(anchors.prefix(CapturePilot.maxAnchors))
+    }
     let engine = engine
+    let snapshotsToFeed = anchors
     DispatchQueue.global(qos: .userInitiated).async {
-      for a in anchors { engine.update(a) }
+      for a in snapshotsToFeed { engine.update(a) }
     }
   }
 
@@ -212,8 +225,17 @@ final class ScanView: NSObject, ARSCNViewDelegate {
     let node = SCNNode()
     let id = mesh.identifier
     Task { @MainActor in
-      self.nodes[id] = node
-      if let m = self.waiting.removeValue(forKey: id) { self.apply([m]) }
+      if self.engine.pilotActive {
+        self.preparePilotOverlays()
+        // ARSCNView owns the container. Retain it only when we have an overlay to apply.
+        if let m = self.waiting.removeValue(forKey: id) {
+          _ = self.pilotOverlays.node(for: id) { node }
+          self.apply([m])
+        }
+      } else {
+        self.nodes[id] = node
+        if let m = self.waiting.removeValue(forKey: id) { self.apply([m]) }
+      }
     }
     return node
   }
@@ -229,17 +251,33 @@ final class ScanView: NSObject, ARSCNViewDelegate {
     engine.remove(id)
     Task { @MainActor in
       self.nodes[id] = nil
+      self.pilotOverlays.remove([id])
       self.waiting[id] = nil
     }
   }
 
   // MARK: geometry
 
+  private func preparePilotOverlays() {
+    guard engine.pilotActive, !nodes.isEmpty else { return }
+    // Drop any references from initial Continue/relocalization before the pilot was selected.
+    for node in nodes.values { PilotOverlayNodes.clear(node) }
+    nodes.removeAll()
+  }
+
   private func apply(_ meshes: [CoverageEngine.AnchorMesh]) {
+    if engine.pilotActive { preparePilotOverlays() }
     for m in meshes {
       guard m.vertexCount > 0, m.bandCounts.reduce(0, +) > 0 else { continue }
-      guard let node = nodes[m.id] else {
-        waiting[m.id] = m
+      let resolved: SCNNode?
+      if engine.pilotActive {
+        resolved = pilotOverlays.node(for: m.id) {
+          guard let anchor = view.session.currentFrame?.anchors.first(where: { $0.identifier == m.id }) else { return nil }
+          return view.node(for: anchor)
+        }
+      } else { resolved = nodes[m.id] }
+      guard let node = resolved else {
+        if !engine.pilotActive || waiting.count < CapturePilot.maxAnchors { waiting[m.id] = m }
         continue
       }
       // SIMD3<Float> is padded to 16 bytes in Swift arrays
@@ -289,6 +327,33 @@ final class ScanView: NSObject, ARSCNViewDelegate {
   }
 }
 
+/// App-owned references to live overlay containers. ARSCNView owns their parentage and lifecycle.
+/// Never detach these anchor nodes or remove ARKit anchors as a cache eviction policy.
+@MainActor
+final class PilotOverlayNodes {
+  private var nodes: [UUID: SCNNode] = [:]
+  private var recent: [UUID] = []
+  private let limit: Int
+  var count: Int { nodes.count }
+  init(limit: Int) { self.limit = max(1, limit) }
+  func node(for id: UUID, resolve: () -> SCNNode?) -> SCNNode? {
+    guard let node = nodes[id] ?? resolve() else { return nil }
+    if nodes[id] == nil, nodes.count >= limit, let oldest = recent.first { remove([oldest]) }
+    nodes[id] = node
+    recent.removeAll { $0 == id }; recent.append(id)
+    return node
+  }
+  static func clear(_ node: SCNNode) {
+    node.geometry = nil
+    node.childNode(withName: "scan-triangles", recursively: false)?.removeFromParentNode()
+    node.removeAction(forKey: "scan-reveal")
+  }
+  func remove(_ ids: [UUID]) {
+    for id in ids { if let node = nodes.removeValue(forKey: id) { Self.clear(node) } }
+    recent.removeAll { ids.contains($0) }
+  }
+}
+
 /// A thread-safe on/off switch
 final class FeedGate: @unchecked Sendable {
   private let lock = NSLock()
@@ -328,6 +393,9 @@ final class DepthRecorder: @unchecked Sendable {
   private var last: (time: TimeInterval, pose: simd_float4x4)?
   private var next = 0
   private var inFlight = 0
+  var pendingWrites: Int { inFlight }
+  var pilot = false
+  var onFailure: ((String) -> Void)?
   private let ci = CIContext()
 
   init(bundle: ScanBundle) {
@@ -365,23 +433,50 @@ final class DepthRecorder: @unchecked Sendable {
     let confData = depth.confidenceMap.map(Self.bytes)
     inFlight += 1
     queue.async {
-      try? ((try? (depthData as NSData).compressed(using: .zlib)) as Data? ?? depthData).write(to: self.bundle.file(record.file))
-      try? confData?.write(to: self.bundle.file(record.confidence))
-      if let cg, let rgb = record.rgb, let dest = CGImageDestinationCreateWithURL(self.bundle.file(rgb) as CFURL, "public.jpeg" as CFString, 1, nil) {
-        CGImageDestinationAddImage(dest, cg, [kCGImageDestinationLossyCompressionQuality: 0.8] as CFDictionary)
-        CGImageDestinationFinalize(dest)
+      let result = Result {
+        try Self.writeDepthPayload(depthData, confidence: confData,
+          depthURL: self.bundle.file(record.file), confidenceURL: self.bundle.file(record.confidence), strict: self.pilot)
+        if let cg, let rgb = record.rgb {
+          if let dest = CGImageDestinationCreateWithURL(self.bundle.file(rgb) as CFURL, "public.jpeg" as CFString, 1, nil) {
+            CGImageDestinationAddImage(dest, cg, [kCGImageDestinationLossyCompressionQuality: 0.8] as CFDictionary)
+            let saved = CGImageDestinationFinalize(dest)
+            if self.pilot && !saved { throw CocoaError(.fileWriteUnknown) }
+          } else if self.pilot { throw CocoaError(.fileWriteUnknown) }
+        }
+        if self.pilot {
+          let folder = self.bundle.file("pilot/depth-records")
+          try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+          try JSONEncoder().encode(record).write(to: folder.appendingPathComponent("\(name).json"), options: .atomic)
+        }
       }
       DispatchQueue.main.async {
-        self.records.append(record)
+        switch result {
+        case .success: self.records.append(record)
+        case .failure(let error): self.onFailure?("Depth evidence could not be saved: " + error.localizedDescription)
+        }
         self.inFlight -= 1
       }
+    }
+  }
+
+  /// Preserve baseline's historical best-effort writes and optional confidence map.
+  /// Pilot acceptance is stricter because a committed sidecar promises complete evidence.
+  static func writeDepthPayload(_ depth: Data, confidence: Data?, depthURL: URL, confidenceURL: URL, strict: Bool) throws {
+    if strict {
+      let compressed = try (depth as NSData).compressed(using: .zlib) as Data
+      try compressed.write(to: depthURL, options: .atomic)
+      guard let confidence else { throw CocoaError(.fileWriteUnknown) }
+      try confidence.write(to: confidenceURL, options: .atomic)
+    } else {
+      try? ((try? (depth as NSData).compressed(using: .zlib)) as Data? ?? depth).write(to: depthURL)
+      try? confidence?.write(to: confidenceURL)
     }
   }
 
   func save() throws {
     let e = JSONEncoder()
     e.outputFormatting = [.prettyPrinted]
-    try e.encode(records).write(to: bundle.file("depth/frames.json"))
+    try e.encode(records).write(to: bundle.file("depth/frames.json"), options: .atomic)
   }
 
   func discard(room: Int) {

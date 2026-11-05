@@ -74,7 +74,35 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
   @Published private(set) var rooms: [RoomRecord] = []
   @Published private(set) var photoCount = 0
   private let autoPhotos = true
-  @Published var highResolutionPhotos = false
+  @Published var highResolutionPhotos = CapturePilot.available
+  @Published private(set) var captureStarted = false
+  @Published var experimentalHouse = CapturePilot.available {
+    didSet {
+      if captureStarted { experimentalHouse = oldValue; return }
+      guard oldValue != experimentalHouse else { return }
+      if pilot {
+        priorPhotoLoadGate.invalidate()
+        priorPhotos.removeAll(); priorPhotoCount = 0
+        engine.reset(photos: enginePhotos)
+      } else { loadPriorPhotos() }
+    }
+  }
+  @Published var pilotRoomLimit = 21 { didSet { if captureStarted { pilotRoomLimit = oldValue } } }
+  var pilot: Bool { CapturePilot.available && experimentalHouse }
+  @Published private(set) var pilotMeshAnchors = 0
+  @Published private(set) var pilotMeshBytes = 0
+  @Published private(set) var pilotScoringPhotos = 0
+  @Published private(set) var highResolutionSummary = "No photos saved yet"
+  private var peakMemoryMB: Double = 0
+  private var savedMapBytes: Int?
+  private var pilotConfigured = false
+  private var reportedSkippedUpdates = 0
+  var highResolutionStatus: String {
+    if !highResolutionPhotos { return highResolutionSummary + " · High-resolution photos are switched off." }
+    if !highResSupported { return highResolutionSummary + " · High-resolution capture unavailable; regular reference frames only." }
+    if captureBudget.constrained || ProcessInfo.processInfo.thermalState != .nominal { return highResolutionSummary + " · High-resolution capture paused by thermal or memory safeguards; regular frames may be saved." }
+    return highResolutionSummary + " · High-resolution requests enabled; regular frames may still be saved."
+  }
   @Published private(set) var trackingIssue: TrackingRecovery.Issue? = .starting
   @Published private(set) var sessionNeedsRestart = false
   @Published private(set) var recordingSaveFailed = false
@@ -160,6 +188,7 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
   private var enginePhotos: [CoverageEngine.Photo] = []
   /// earlier photos of the zone (Continue), counted for coverage but not saved in this bundle
   private var priorPhotos: [CoverageEngine.Photo] = []
+  private var priorPhotoLoadGate = PriorPhotoLoadGate()
   private var displayLink: CADisplayLink?
   private var previousPose: (time: TimeInterval, pose: simd_float4x4)?
   private var poseHistory: [(time: TimeInterval, pose: simd_float4x4)] = []
@@ -526,7 +555,7 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
     applyGhostOpacity()
     scanView.feed.isOn = captureReady
     if captureReady { scanView.refeedEngine(from: arSession) }
-    loadPriorPhotos()
+    if !pilot { loadPriorPhotos() }
     UINotificationFeedbackGenerator().notificationOccurred(.success)
     show(notice: residual.map { "Lined up with your earlier scan (±\(String(format: "%.1f", $0 * 100)) cm). Pick up where you left off." }
       ?? "Relocalized in \(zoneName). Pick up where you left off.")
@@ -602,15 +631,16 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
   }
 
   private func loadPriorPhotos() {
+    guard let token = priorPhotoLoadGate.request(allowed: !pilot && !closed && alignment.method == "relocalized") else { return }
     let snapshot = house, zone = plan.zoneID, session = plan.sessionID
     Task.detached(priority: .utility) { [weak self] in
       let photos = PriorPhotos.load(house: snapshot, zone: zone, excludingSession: session)
-      await self?.priorPhotosLoaded(photos)
+      await self?.priorPhotosLoaded(photos, token: token)
     }
   }
 
-  private func priorPhotosLoaded(_ photos: [CoverageEngine.Photo]) {
-    guard alignment.method == "relocalized", !closed else { return }
+  private func priorPhotosLoaded(_ photos: [CoverageEngine.Photo], token: Int) {
+    guard priorPhotoLoadGate.accept(token, allowed: !pilot && !closed && alignment.method == "relocalized") else { return }
     priorPhotos = photos
     priorPhotoCount = photos.count
     engine.add(contentsOf: photos)
@@ -654,7 +684,7 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
     source.title = last.name
     return source
   }
-  var requiresFreshScan: Bool { warnedBigMap || rooms.count >= 4 }
+  var requiresFreshScan: Bool { CapturePilot.requiresFinish(completed: rooms.count, largeMap: warnedBigMap, experimental: pilot, roomLimit: pilotRoomLimit) }
 
   var selectedRoomID: String?
   var existingRooms: [HouseProject.Room] { house.rooms.filter { r in !r.history.contains { $0.session == plan.sessionID } } }
@@ -668,6 +698,33 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
     guard canStartRoom else { return }
     do { try CaptureReadiness.requireStorage(at: bundle.url) }
     catch { lastWarning = error.localizedDescription; return }
+    if pilot {
+      do {
+        try engine.beginPilotRoom(root: bundle.file("pilot/mesh"), room: roomIndex)
+        pilotMeshAnchors = 0; pilotMeshBytes = 0; pilotScoringPhotos = 0
+        try checkpointPilotPolicy()
+      } catch { recordingSaveFailed = true; lastWarning = "Pilot evidence storage could not start: " + error.localizedDescription; return }
+      engine.onPilotFailure = { [weak self] message in
+        guard let self else { return }
+        self.recordingSaveFailed = true; self.sessionNeedsRestart = true
+        self.pause(); self.lastWarning = message
+        self.diagnostics.log(message, since: self.startedAt)
+      }
+      engine.onPilotMetrics = { [weak self] anchors, bytes, photos in
+        self?.pilotMeshAnchors = anchors; self?.pilotMeshBytes = bytes; self?.pilotScoringPhotos = photos
+      }
+      depthRecorder.pilot = true
+      priorPhotoLoadGate.invalidate()
+      enginePhotos.removeAll(); priorPhotos.removeAll(); photoViews.removeAll()
+      capturedRooms.removeAll(); reference = nil; scanView.setGhost(nil)
+      pilotConfigured = true
+    }
+    depthRecorder.onFailure = { [weak self] message in
+      guard let self, self.pilot else { return }
+      self.recordingSaveFailed = true; self.pause(); self.lastWarning = message
+    }
+    captureStarted = true
+    if !pilot { loadPriorPhotos() } // also cover baseline selected immediately before first room
     recovery = TrackingRecovery()
     trackingIssue = recovery.issue
     meshReadyAt = nil
@@ -682,6 +739,7 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
     lastCoverageProgress = Date()
     lastProgressPercent = 0
     roomPhotoCount = 0
+    highResolutionSummary = "Room: 0/0 high-resolution; no photos saved yet"
     hint = .none
     engine.setRoom(nil)
     scanView.showRoom(nil)
@@ -689,6 +747,7 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
     applyGhostOpacity()
     refreshCoverage()
     diagnostics.log("room \(roomIndex) '\(roomName)' start", since: startedAt)
+    diagnostics.log("RoomPlan run on same ARSession; resetTracking=false; completed rooms \(rooms.count)", since: startedAt)
     roomSession.run(configuration: RoomCaptureSession.Configuration())
     sessionRunning = true
     UIApplication.shared.isIdleTimerDisabled = true
@@ -708,6 +767,10 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
     Task {
       await drainPhotos()
       guard !closed, phase == .finishingRoom else { return }
+      if pilot {
+        let anchors = arSession.currentFrame?.anchors.compactMap { $0 as? ARMeshAnchor } ?? []
+        await withCheckedContinuation { c in engine.snapshotPilotBoundary(anchors) { c.resume() } }
+      }
       preStopMesh = await withCheckedContinuation { c in engine.exportPLY(to: file) { c.resume(returning: $0) } }
       guard !closed, phase == .finishingRoom else { return }
       cameraControl.unlock()
@@ -771,6 +834,7 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
     }
     scanView.feed.isOn = false
     await drainPhotos()
+    while depthRecorder.pendingWrites > 0 && !closed { try? await Task.sleep(for: .milliseconds(50)) }
     guard !closed else { return }
     let index = roomIndex
     let capturedAt = Date()
@@ -784,9 +848,13 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
       return (try? json.write(to: dataFile, options: .atomic)) != nil
     }.value
     if savedData { record.data = "rooms/room-\(index)-data.json" }
+    else if pilot { recordingSaveFailed = true; lastWarning = "Raw room evidence could not be saved. Finish this session and preserve its folder." }
     do {
       let room = try await RoomBuilder(options: [.beautifyObjects]).capturedRoom(from: data)
-      try bundle.saveRoom(room, index: index)
+      if pilot {
+        try JSONEncoder().encode(room).write(to: bundle.file("rooms/room-\(index).json"), options: .atomic)
+        record.usdz = "" // deferred exports; do not claim an on-phone USDZ exists
+      } else { try bundle.saveRoom(room, index: index) }
       record.walls = room.walls.count
       record.doors = room.doors.count
       record.windows = room.windows.count
@@ -808,6 +876,9 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
     if case .success(let r)? = result, r.vertices > 0 {
       record.mesh = MeshRecord(file: meshFile, anchors: 0, vertices: r.vertices, faces: r.faces)
       record.coverage = r.covered
+    }
+    if pilot, case .failure(let error)? = result {
+      recordingSaveFailed = true; lastWarning = "Mesh export failed; journal chunks are preserved: " + error.localizedDescription
     }
     record.photoCoverage = record.photographedPercent
     record.detailSeconds = roomStartedAt.map { Date().timeIntervalSince($0) }
@@ -846,8 +917,8 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
 
   /// Throws away the most recently captured room (e.g. to rescan it).
   func discardLastRoom() {
-    guard phase == .betweenRooms, let last = rooms.popLast() else { return }
-    if !last.file.isEmpty { capturedRooms.removeLast() }
+    guard !pilotConfigured, phase == .betweenRooms, let last = rooms.popLast() else { return }
+    if !last.file.isEmpty, !capturedRooms.isEmpty { capturedRooms.removeLast() }
     bundle.deleteRoom(index: last.index)
     try? FileManager.default.removeItem(at: bundle.file("mesh/room-\(last.index).ply"))
     for photo in photos where photo.room == last.index {
@@ -902,6 +973,14 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
       }
     } catch {
       phase = .failed(error.localizedDescription)
+      return
+    }
+
+    if pilotConfigured {
+      diagnostics.log("Structure merge and texture reconstruction deferred to Mac; all rooms keep this ARSession frame", since: startedAt)
+      do { try checkpointPilotPolicy(); try writeManifest(structureError: "Pilot: structure merge deferred") }
+      catch { phase = .failed(error.localizedDescription); return }
+      phase = .done
       return
     }
 
@@ -1003,6 +1082,7 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
     let written = await Task.detached(priority: .utility) { Result { try WorldMapFile.write(map, to: targets) } }.value
     switch written {
     case .success(let bytes):
+      savedMapBytes = bytes
       worldMapSaved = true
       worldMapStatus = status == .mapped ? "mapped" : "extending (saved before ARKit finished mapping: may relocalize less reliably)"
       let mb = Double(bytes) / 1_000_000
@@ -1017,7 +1097,7 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
       }
       if mb > 40, !warnedBigMap {
         warnedBigMap = true
-        lastWarning = "Finish and save this scan before scanning another room. The next scan will start fresh to keep capture responsive."
+        lastWarning = pilot ? "Large tracking map. The experimental session will continue without a reset, but ARKit memory and drift can still grow. Save if tracking or responsiveness degrades." : "Finish and save this scan before scanning another room. The next scan will start fresh to keep capture responsive."
       }
     case .failure(let e):
       diagnostics.log("world map write failed: \(e.localizedDescription)", since: startedAt)
@@ -1049,8 +1129,27 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
       photoCount: photos.count,
       depthFrames: depthRecorder.records.isEmpty ? nil : "depth/frames.json",
       depthFrameCount: depthRecorder.records.count,
-      diagnostics: diagnostics
+      diagnostics: diagnostics,
+      capturePilot: pilotConfigured ? "pilot/session.json" : nil
     ))
+  }
+
+  private func checkpointPilotPolicy() throws {
+    let info: [String: Any] = ["format": "capture-pilot/1", "mode": "continuous-experimental",
+      "roomLimit": pilotRoomLimit, "completedRooms": rooms.count, "oneARSession": true,
+      "requestedTrackingResetsDuringRooms": 0, "initialRelocalization": plan.worldMap != nil,
+      "continuityNote": "One controller-owned ARSession; framework interruptions and detected jumps are logged in diagnostics, not a guarantee of continuous tracking.",
+      "skippedLiveMeshUpdates": engine.skippedMeshUpdates, "meshJournal": "pilot/mesh",
+      "liveMeshBytesLimit": CapturePilot.meshBytes, "liveAnchorLimit": CapturePilot.maxAnchors,
+      "pendingMeshBytesLimit": CapturePilot.pendingBytes, "scoringPhotosLimit": CapturePilot.maxPhotos,
+      "nativeHighResolutionPhotos": highResolutionPhotos,
+      "note": "Latest observed mesh anchor per room, not cropped. Live coverage uses a bounded recent subset; final PLY coverage may be older. ARKit map memory is not bounded. A tracking jump requires review. Structure/texturing deferred."]
+    try FileManager.default.createDirectory(at: bundle.file("pilot"), withIntermediateDirectories: true)
+    try JSONSerialization.data(withJSONObject: info, options: [.prettyPrinted, .sortedKeys]).write(to: bundle.file("pilot/session.json"), options: .atomic)
+    if phase == .betweenRooms, !roomName.isEmpty {
+      let room: [String: Any] = ["index": roomIndex, "name": roomName, "state": "capture-started", "frame": "same ARSession"]
+      try JSONSerialization.data(withJSONObject: room, options: [.sortedKeys]).write(to: bundle.file("pilot/room-\(roomIndex).json"), options: .atomic)
+    }
   }
 
   // MARK: - Live room + coverage
@@ -1093,7 +1192,13 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
     guard let c = arSession.configuration as? ARWorldTrackingConfiguration else { return }
     let depthOK = !ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) || c.frameSemantics.contains(.sceneDepth)
     let meshOK = c.sceneReconstruction.contains(.meshWithClassification)
-    if meshOK, depthOK {
+    let preferred = pilot && highResolutionPhotos ? ARWorldTrackingConfiguration.recommendedVideoFormatForHighResolutionFrameCapturing : nil
+    let formatOK = preferred.map {
+      c.videoFormat.imageResolution == $0.imageResolution && c.videoFormat.framesPerSecond == $0.framesPerSecond &&
+      c.videoFormat.isRecommendedForHighResolutionFrameCapturing == $0.isRecommendedForHighResolutionFrameCapturing &&
+      c.videoFormat.captureDeviceType == $0.captureDeviceType && c.videoFormat.captureDevicePosition == $0.captureDevicePosition
+    } ?? true
+    if meshOK, depthOK, formatOK {
       if !meshReady {
         meshReady = true
         meshReadyAt = CACurrentMediaTime()
@@ -1106,6 +1211,7 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
       diagnostics.roomPlanConfiguration = "\(type(of: c)) reconstruction=\(c.sceneReconstruction.rawValue) semantics=\(c.frameSemantics.rawValue) worldMap=\(c.initialWorldMap != nil)"
     }
     updated.initialWorldMap = nil
+    if let preferred { updated.videoFormat = preferred }
     updated.sceneReconstruction.insert(.meshWithClassification)
     if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) { updated.frameSemantics.insert(.sceneDepth) }
     meshReady = false
@@ -1118,6 +1224,7 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
     guard !closed else { return }
     memoryPressureUntil = CACurrentMediaTime() + 60
     candidate = nil
+    if pilot { pause(); lastWarning = "Memory warning: recording paused; tracking continues. Save this room before deciding whether to continue. ARKit map memory is not bounded by the pilot." }
     diagnostics.memoryWarnings = (diagnostics.memoryWarnings ?? 0) + 1
     diagnostics.log("memory warning", since: startedAt)
     sampleDiagnostics(force: true)
@@ -1125,6 +1232,7 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
 
   @objc private func thermalChanged() {
     guard !closed else { return }
+    if pilot, ProcessInfo.processInfo.thermalState == .critical { pause(); lastWarning = "Phone critically hot: recording paused. Save the room and let it cool; tracking may fail." }
     diagnostics.log("thermal " + Diagnostics.thermalDescription(ProcessInfo.processInfo.thermalState), since: startedAt)
     sampleDiagnostics(force: true)
   }
@@ -1138,12 +1246,19 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
       pause()
       lastWarning = "Storage is almost full. Recording is paused. Finish this room to save what is available, then free space before continuing."
     }
+    if pilot, engine.skippedMeshUpdates > reportedSkippedUpdates {
+      reportedSkippedUpdates = engine.skippedMeshUpdates
+      lastWarning = "Live mesh writer delayed \(reportedSkippedUpdates) updates. Current anchors will be checkpointed again when saving; removed anchors may have gaps. Photos and accepted evidence are preserved."
+      diagnostics.log("pilot mesh backpressure: \(reportedSkippedUpdates) skipped updates", since: startedAt)
+    }
     let frame = arSession.currentFrame
     let meshes = frame?.anchors.compactMap { $0 as? ARMeshAnchor } ?? []
+    let memory = Diagnostics.memoryFootprintMB()
+    peakMemoryMB = max(peakMemoryMB, memory ?? 0)
     diagnostics.recordSample(.init(
       t: Date().timeIntervalSince(startedAt), phase: "\(phase)",
       thermal: Diagnostics.thermalDescription(ProcessInfo.processInfo.thermalState),
-      memoryMB: Diagnostics.memoryFootprintMB(),
+      memoryMB: memory,
       frameAgeSeconds: frame.map { max(0, now - $0.timestamp) },
       tracking: frame.map { Self.describeTracking($0.camera.trackingState) },
       mapping: frame.map { WorldMapFile.describe($0.worldMappingStatus) },
@@ -1151,7 +1266,11 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
       meshAnchors: meshes.count, meshVertices: meshes.reduce(0) { $0 + $1.geometry.vertices.count },
       photos: photos.count, depthFrames: depthRecorder.records.count, photosInFlight: photosInFlight,
       coverageQueueDelayMS: coverageQueueDelayMS,
-      pendingMeshUpdates: engine.pendingMeshUpdates, coalescedMeshUpdates: engine.coalescedMeshUpdates))
+      pendingMeshUpdates: engine.pendingMeshUpdates, coalescedMeshUpdates: engine.coalescedMeshUpdates,
+      peakMemoryMB: peakMemoryMB, worldMapBytes: savedMapBytes,
+      appMeshAnchors: pilot ? pilotMeshAnchors : nil, appMeshBytes: pilot ? pilotMeshBytes : nil,
+      scoringPhotos: pilot ? pilotScoringPhotos : nil, pendingMeshBytes: engine.pendingMeshBytes,
+      depthWritesInFlight: depthRecorder.pendingWrites, skippedMeshUpdates: engine.skippedMeshUpdates))
     if !coverageProbePending {
       coverageProbePending = true
       engine.measureQueueDelay { [weak self] delay in
@@ -1295,6 +1414,10 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
       let jump = simd_distance(pose.columns.3, prev.pose.columns.3)
       if jump > 0.5, frame.timestamp - prev.time < 0.2 {
         diagnostics.worldJumps.append(.init(time: frame.timestamp, meters: jump, phase: "\(phase)"))
+        if pilot {
+          pause()
+          lastWarning = "Possible tracking jump (\(String(format: "%.2f", jump)) m). Recording paused. Saved evidence remains in this session; its alignment needs review. No reset was requested."
+        }
       }
     }
     previousPose = (frame.timestamp, pose)
@@ -1324,7 +1447,7 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
     }
     guard !paused, captureReady else { return }
     let budget = captureBudget
-    depthRecorder.consider(frame, room: roomIndex, camera: cameraControl.state(for: frame), interval: budget.depthInterval)
+    depthRecorder.consider(frame, room: roomIndex, camera: cameraControl.state(for: frame), interval: pilot ? max(1, budget.depthInterval) : budget.depthInterval)
     if frame.timestamp - lastEvaluate > budget.evaluationInterval {
       lastEvaluate = frame.timestamp
       engine.evaluate(view: Self.enginePhoto(frame: frame, sharpness: 1, depth: nil, room: roomIndex))
@@ -1477,7 +1600,7 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
 
     let fileName = String(format: "%04d.jpg", nextPhotoID)
     nextPhotoID += 1
-    let scale = min(1, Self.maxPhotoEdge / max(shot.resolution.width, shot.resolution.height))
+    let scale = min(1, (pilot && shot.highRes ? max(shot.resolution.width, shot.resolution.height) : Self.maxPhotoEdge) / max(shot.resolution.width, shot.resolution.height))
     var k = shot.intrinsics
     k.columns.0.x *= Float(scale); k.columns.1.y *= Float(scale); k.columns.2.x *= Float(scale); k.columns.2.y *= Float(scale)
     let size = CGSize(width: (shot.resolution.width * scale).rounded(), height: (shot.resolution.height * scale).rounded())
@@ -1514,21 +1637,38 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
     }
     let url = bundle.file(record.file)
     let context = ciContext
+    let persistPilotPhoto = pilotConfigured
+    let photoJournal = bundle.file("pilot/photo-records")
     Task.detached(priority: .utility) {
-      let ok = Self.writeJPEG(image, to: url, context: context)
+      var ok = Self.writeJPEG(image, to: url, context: context)
+      if ok, persistPilotPhoto {
+        do {
+          let folder = photoJournal
+          try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+          try JSONEncoder().encode(record).write(to: folder.appendingPathComponent(fileName + ".json"), options: .atomic)
+        } catch { ok = false }
+      }
+      let saved = ok
       await MainActor.run {
         defer { self.photosInFlight -= 1 }
         guard !self.closed else { return }
-        if ok {
+        if saved {
           self.photos.append(record)
           self.photoViews.append((record.room, view))
           self.enginePhotos.append(enginePhoto)
+          if self.pilot {
+            self.enginePhotos = Array(self.enginePhotos.suffix(CapturePilot.maxPhotos))
+            self.photoViews = Array(self.photoViews.suffix(CapturePilot.maxPhotos))
+          }
+          let roomPhotos = self.photos.filter { $0.room == record.room }
+          self.highResolutionSummary = "Room: \(roomPhotos.filter { $0.highRes == true }.count)/\(roomPhotos.count) high-resolution · last \(record.width)×\(record.height) \(record.highRes == true ? "high-resolution API" : "regular frame") · session \(self.photos.filter { $0.highRes == true }.count)/\(self.photos.count) high-resolution"
           self.engine.add(enginePhoto)
           self.photoCount = self.photos.count
           self.roomPhotoCount += 1
           self.refreshCoverage()
         } else {
           self.lastWarning = "A photo could not be saved. Check available storage before continuing."
+          if self.pilot { self.recordingSaveFailed = true; self.pause() }
           self.diagnostics.log("JPEG write failed: \(record.file)", since: self.startedAt)
         }
       }

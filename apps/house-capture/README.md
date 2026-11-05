@@ -11,6 +11,14 @@ rebuild pipeline (`scan-to-threejs` skill) can use directly. Per room it records
 
 Requires an iPhone or iPad **with LiDAR** running iOS 17+.
 
+## Experimental whole-house pilot
+
+A separate `3D Capture Pilot` build supports an explicit experimental 21-room policy on one
+continuous ARSession, bounded recent app-owned geometry, disk-journaled evidence, native
+high-resolution API photo sizes, and offline verified transfer/mesh assembly. The standard
+app behavior is unchanged. See [pilot build, capture, recovery and validation instructions](../../docs/capture-pilot.md).
+This does not guarantee a successful 21-room scan or bound ARKit map memory.
+
 ## Build
 
 ```sh

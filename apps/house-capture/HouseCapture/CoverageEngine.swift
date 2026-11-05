@@ -82,6 +82,76 @@ final class CoverageEngine: @unchecked Sendable {
 
   /// Called on main with anchors whose colors (or geometry) changed
   var onMeshes: (([AnchorMesh]) -> Void)?
+  var onEvicted: (([UUID]) -> Void)?
+  var onPilotFailure: ((String) -> Void)?
+  var onPilotMetrics: ((Int, Int, Int) -> Void)?
+  private var journal: PilotMeshJournal?
+  // Lock order: ingress may wait for worker; worker code never acquires inputLock.
+  // Both update entry points call enqueue directly under ingress (never recursively lock).
+  private let inputLock = NSLock()
+  private let meshUpdateDelay: TimeInterval?
+  /// Optional batching delay permits deterministic tests of exports/room barriers with pending input.
+  init(meshUpdateDelay: TimeInterval? = nil) { self.meshUpdateDelay = meshUpdateDelay }
+  private var recentAnchors: [UUID] = []
+  private var pilotFailed = false
+  private var pilotEnabled = false
+  private var skippedUpdates = 0
+  var pilotActive: Bool { lock.withLock { pilotEnabled } }
+  var skippedMeshUpdates: Int { lock.withLock { skippedUpdates } }
+  private var workingBytes: Int { anchors.values.reduce(0) { $0 + $1.world.count * 80 + $1.faces.count * 5 } }
+
+  func beginPilotRoom(root: URL, room: Int) throws {
+    // Serialize snapshot copying/admission with the worker barrier. An input already being copied
+    // must finish before the previous room's mailbox is drained and the journal changes.
+    inputLock.lock()
+    defer { inputLock.unlock() }
+    try queue.sync {
+      if let (_, value) = self.pendingRooms.take().first {
+        (self.targets, self.outline, self.floorY, self.ceilingY) = value
+        self.scoreTargets()
+        for a in self.anchors.values { self.classify(a) }
+      }
+      self.process(self.pending.take()) // persist accepted updates under the previous journal
+      guard !self.lock.withLock({ self.pilotFailed }) else {
+        throw CocoaError(.fileWriteUnknown, userInfo: [NSLocalizedDescriptionKey: "Previous room mesh could not be checkpointed. Its journal and accepted evidence are preserved; finish this session."])
+      }
+      let nextJournal = try PilotMeshJournal(root: root, room: room)
+      self.journal = nextJournal
+      let old = Array(self.anchors.keys)
+      self.anchors.removeAll(); self.recentAnchors.removeAll(); self.photos.removeAll()
+      _ = self.pendingMeshes.take() // no old-room render payload may cross this barrier
+      self.lock.withLock { self.pilotEnabled = true }
+      self.pending.configure(maxCount: 64, maxCost: CapturePilot.pendingBytes)
+      self.pendingMeshes.configure(maxCount: 48, maxCost: CapturePilot.meshBytes)
+      DispatchQueue.main.async { self.onEvicted?(old) }
+      self.publishPilotMetrics()
+    }
+  }
+
+  /// At a room boundary, recover current ARKit anchors serially without creating a house-sized snapshot array.
+  /// ARKit owns these anchor buffers; the app copies and journals one bounded anchor at a time.
+  func snapshotPilotBoundary(_ anchors: [ARMeshAnchor], completion: @escaping () -> Void) {
+    queue.async {
+      self.process(self.pending.take())
+      for anchor in anchors {
+        if self.lock.withLock({ self.pilotFailed }) { break }
+        if anchor.geometry.vertices.count * 32 + anchor.geometry.faces.count * 13 > CapturePilot.pendingBytes {
+          self.failPilot("A final mesh anchor exceeds the pilot limit; saved chunks are preserved.")
+          break
+        }
+        autoreleasepool { self.process([(anchor.identifier, anchor.snapshot())]) }
+      }
+      DispatchQueue.main.async { completion() }
+    }
+  }
+
+  private func failPilot(_ message: String) {
+    let first = lock.withLock { () -> Bool in
+      guard !pilotFailed else { return false }; pilotFailed = true; return true
+    }
+    if first { DispatchQueue.main.async { self.onPilotFailure?(message) } }
+  }
+
   var onStats: ((Stats) -> Void)?
 
   /// Latest estimate of how much the current view would add, in m² of surface
@@ -156,22 +226,43 @@ final class CoverageEngine: @unchecked Sendable {
 
   /// Mesh anchor added or updated. Copies the geometry immediately (call from any thread).
   func update(_ anchor: ARMeshAnchor) {
-    update(snapshot: anchor.snapshot())
+    inputLock.withLock {
+      guard !lock.withLock({ pilotFailed }) else { return }
+      if lock.withLock({ pilotEnabled }), anchor.geometry.vertices.count * 32 + anchor.geometry.faces.count * 13 > CapturePilot.pendingBytes {
+        failPilot("A mesh anchor exceeded the pilot buffer limit. Finish and preserve this session.")
+        return
+      }
+      enqueue(snapshot: anchor.snapshot())
+    }
   }
 
   /// Coalesce before entering the worker queue: at most one waiting snapshot per anchor.
   func update(snapshot: ARMeshAnchor.Snapshot) {
-    if pending.offer(snapshot.id, snapshot) {
-      queue.asyncAfter(deadline: .now() + 0.15) { self.drain() }
+    inputLock.withLock { enqueue(snapshot: snapshot) }
+  }
+
+  private func enqueue(snapshot: ARMeshAnchor.Snapshot) {
+    guard !lock.withLock({ pilotFailed }) else { return }
+    let cost = snapshot.positions.count * 32 + snapshot.faces.count * 4 + snapshot.classes.count
+    let result = pending.offerChecked(snapshot.id, snapshot, cost: cost)
+    if !result.accepted { lock.withLock { skippedUpdates += 1 } }
+    if result.schedule {
+      queue.asyncAfter(deadline: .now() + (meshUpdateDelay ?? (pilotActive ? 0 : 0.15))) { self.drain() }
     }
   }
 
   /// Preserve the last snapshot even if RoomPlan removes anchors while stopping.
-  func remove(_ id: UUID) {}
+  func remove(_ id: UUID) {
+    queue.async {
+      do { try self.journal?.removed(id) }
+      catch { self.failPilot("Could not checkpoint a mesh removal: " + error.localizedDescription) }
+    }
+  }
 
   func add(_ photo: Photo) {
     queue.async {
       self.photos.append(photo)
+      if self.journal != nil { self.photos = Array(self.photos.suffix(CapturePilot.maxPhotos)) }
       var changed: [AnchorMesh] = []
       for a in self.anchors.values where self.score(a, with: photo) {
         changed.append(self.mesh(for: a))
@@ -183,6 +274,7 @@ final class CoverageEngine: @unchecked Sendable {
       }
       self.emit(changed)
       self.publishStats()
+      self.publishPilotMetrics()
     }
   }
 
@@ -191,6 +283,7 @@ final class CoverageEngine: @unchecked Sendable {
     guard !photos.isEmpty else { return }
     queue.async {
       self.photos.append(contentsOf: photos)
+      if self.journal != nil { self.photos = Array(self.photos.suffix(CapturePilot.maxPhotos)) }
       var changed: [AnchorMesh] = []
       for a in self.anchors.values {
         self.rescore(a)
@@ -199,13 +292,14 @@ final class CoverageEngine: @unchecked Sendable {
       self.scoreTargets()
       self.emit(changed)
       self.publishStats()
+      self.publishPilotMetrics()
     }
   }
 
   /// Rebuild all scores from scratch (after photos were discarded)
   func reset(photos: [Photo]) {
     queue.async {
-      self.photos = photos
+      self.photos = self.journal == nil ? photos : Array(photos.suffix(CapturePilot.maxPhotos))
       var changed: [AnchorMesh] = []
       for a in self.anchors.values {
         self.rescore(a)
@@ -214,6 +308,7 @@ final class CoverageEngine: @unchecked Sendable {
       self.scoreTargets()
       self.emit(changed)
       self.publishStats()
+      self.publishPilotMetrics()
     }
   }
 
@@ -238,6 +333,7 @@ final class CoverageEngine: @unchecked Sendable {
   }
   private var pendingView: Photo?
 
+  var pendingMeshBytes: Int { pending.pendingCost }
   var pendingMeshUpdates: Int { pending.counts.pending }
   var coalescedMeshUpdates: Int { pending.counts.replaced }
 
@@ -296,7 +392,10 @@ final class CoverageEngine: @unchecked Sendable {
           for a in self.anchors.values { self.classify(a) }
         }
         self.process(self.pending.take())
-        let result = try self.writePLY(url)
+        if let journal = self.journal {
+          for a in self.anchors.values { try self.persist(a, in: journal) }
+        }
+        let result = try self.journal.map { try $0.export(to: url) } ?? self.writePLY(url)
         DispatchQueue.main.async { completion(.success(result)) }
       } catch {
         DispatchQueue.main.async { completion(.failure(error)) }
@@ -444,10 +543,42 @@ final class CoverageEngine: @unchecked Sendable {
       a.score = [Float](repeating: 0, count: a.world.count)
       classify(a)
       rescore(a, previousWorld: previousWorld, previousNormals: previousNormals, previousScores: previousScores)
-      changed.append(mesh(for: a))
+      if let journal {
+        do { try persist(a, in: journal) }
+        catch { failPilot("Mesh evidence could not be saved: " + error.localizedDescription) }
+        recentAnchors.removeAll { $0 == id }; recentAnchors.append(id)
+        var evicted: [UUID] = []
+        while anchors.count > CapturePilot.maxAnchors || workingBytes > CapturePilot.meshBytes {
+          guard let oldest = recentAnchors.first else { break }
+          // Each anchor has been durably journaled before its scored copy is released.
+          if lock.withLock({ pilotFailed }) { break }
+          recentAnchors.removeFirst(); anchors.removeValue(forKey: oldest); evicted.append(oldest)
+        }
+        if !evicted.isEmpty {
+          changed.removeAll { evicted.contains($0.id) }
+          pendingMeshes.remove(evicted)
+          DispatchQueue.main.async { self.onEvicted?(evicted) }
+        }
+        publishPilotMetrics()
+      }
+      if anchors[id] != nil { changed.append(mesh(for: a)) }
     }
     emit(changed)
     publishStats()
+  }
+
+  /// Worker-queue snapshot for every mutation of retained mesh/photo state.
+  private func publishPilotMetrics() {
+    guard journal != nil else { return }
+    let count = anchors.count, bytes = workingBytes, photoCount = photos.count
+    DispatchQueue.main.async { self.onPilotMetrics?(count, bytes, photoCount) }
+  }
+
+  private func persist(_ a: AnchorData, in journal: PilotMeshJournal) throws {
+    let result = plyData([a])
+    let total = a.area.indices.reduce(Float(0)) { $0 + (a.inRoom[$1] ? a.area[$1] : 0) }
+    try journal.store(id: a.id, ply: result.data, vertices: a.world.count, faces: a.faces.count / 3,
+                      coveredArea: result.covered * total, totalArea: total)
   }
 
   /// Which vertices belong to the current room (inside its outline, between floor and ceiling)
@@ -581,7 +712,8 @@ final class CoverageEngine: @unchecked Sendable {
 
   private func emit(_ meshes: [AnchorMesh]) {
     var schedule = false
-    for mesh in meshes { if pendingMeshes.offer(mesh.id, mesh) { schedule = true } }
+    // positions, normals and each band are Data; .count is already bytes, not SIMD elements.
+    for mesh in meshes { if pendingMeshes.offerChecked(mesh.id, mesh, cost: mesh.positions.count + mesh.normals.count + mesh.bands.reduce(0) { $0 + $1.count }).schedule { schedule = true } }
     if schedule { DispatchQueue.main.async { self.deliverMeshes() } }
   }
 
@@ -635,7 +767,12 @@ final class CoverageEngine: @unchecked Sendable {
   }
 
   private func writePLY(_ url: URL) throws -> (vertices: Int, faces: Int, covered: Float) {
-    let list = Array(anchors.values)
+    let result = plyData(Array(anchors.values))
+    try result.data.write(to: url, options: .atomic)
+    return (result.vertices, result.faces, result.covered)
+  }
+
+  private func plyData(_ list: [AnchorData]) -> (data: Data, vertices: Int, faces: Int, covered: Float) {
     let vCount = list.reduce(0) { $0 + $1.world.count }
     let fCount = list.reduce(0) { $0 + $1.faces.count / 3 }
     var header = "ply\nformat binary_little_endian 1.0\n"
@@ -672,8 +809,7 @@ final class CoverageEngine: @unchecked Sendable {
       }
       offset += UInt32(a.world.count)
     }
-    try data.write(to: url)
-    return (vCount, fCount, total > 0 ? covered / total : 0)
+    return (data, vCount, fCount, total > 0 ? covered / total : 0)
   }
 
   // MARK: - room geometry helpers
@@ -819,25 +955,37 @@ final class CoverageMailbox<Key: Hashable, Value>: @unchecked Sendable {
   private var order: [Key] = []
   private var scheduled = false
   private var replacements = 0
+  private var costs: [Key: Int] = [:]
+  private var maxCount = Int.max
+  private var maxCost = Int.max
+  func configure(maxCount: Int, maxCost: Int) { lock.withLock { self.maxCount = maxCount; self.maxCost = maxCost } }
+  var pendingCost: Int { lock.withLock { costs.values.reduce(0, +) } }
 
   var counts: (pending: Int, replaced: Int) { lock.withLock { (values.count, replacements) } }
 
   /// True only when the caller must schedule a consumer.
-  func offer(_ key: Key, _ value: Value) -> Bool {
+  func offer(_ key: Key, _ value: Value) -> Bool { offerChecked(key, value, cost: 0).schedule }
+  func offerChecked(_ key: Key, _ value: Value, cost: Int) -> (accepted: Bool, schedule: Bool) {
     lock.withLock {
+      guard (values[key] != nil || values.count < maxCount),
+            cost <= maxCost - (costs.values.reduce(0, +) - (costs[key] ?? 0)) else { return (false, false) }
       if values[key] == nil { order.append(key) } else { replacements += 1 }
-      values[key] = value
-      guard !scheduled else { return false }
+      values[key] = value; costs[key] = cost
+      guard !scheduled else { return (true, false) }
       scheduled = true
-      return true
+      return (true, true)
     }
+  }
+
+  func remove(_ keys: [Key]) {
+    lock.withLock { for key in keys { values[key] = nil; costs[key] = nil }; order.removeAll { keys.contains($0) } }
   }
 
   func take(limit: Int = .max) -> [(Key, Value)] {
     lock.withLock {
       let keys = Array(order.prefix(max(0, limit)))
       order.removeFirst(keys.count)
-      return keys.compactMap { key in values.removeValue(forKey: key).map { (key, $0) } }
+      return keys.compactMap { key in costs[key] = nil; return values.removeValue(forKey: key).map { (key, $0) } }
     }
   }
 
