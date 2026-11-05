@@ -145,6 +145,51 @@ Thermal pressure, memory warnings and long scans reduce depth recording, photo f
 
 After each room, **Review saved room in 3D** opens the textured preview. Use coverage colours to inspect missing photography. A room's **Connect to another room** action shows numbered doorway plans, supports a 180-degree orientation choice, and requires a combined preview before saving. This is manual doorway alignment; it does not claim an automatic verified registration. The reference room must already be placed in the house and both captures must have established tracking.
 
+### Safe room connections and manual openings
+
+**Match floor levels** aligns the floor beneath the selected doorway while keeping its horizontal
+position and orientation. Use it only for the same physical opening on the same floor. Doorway
+centre matching is blocked for missing or implausible heights (below 1 m or at least 3.5 m);
+widths at or outside 0.20–4 m are blocked for either matching mode. These are conservative connection
+checks, not building-code measurements. The two widths must differ by less than 20 cm.
+A floor can be inferred from a single captured floor near a plausible doorway bottom, or supplied
+by a bound floor guide. A tall detection needs a guide; its centre is never used as a floor estimate.
+Staircase endpoints and arbitrary multi-level assembly need a separate workflow.
+
+**Manage openings** lets you choose a numbered saved wall, position a missing opening along it,
+and enter its measured width and height in metres. The opening starts at that wall's saved floor
+edge and must fit within the wall. Check the position and floor edge against the actual doorway.
+This creates a connection marker; it does not cut the captured wall or mesh. Hide and Restore keep
+an observation available without deleting it. Missing or badly captured walls require another scan.
+
+Manual observations live in `manual-openings.json`, separate from captured scans and optional
+`connection-landmarks.json` guides. Each observation is bound to the room ID, active scan reference,
+and SHA-256 of the captured layout. Switching scan versions or changing layout bytes prevents use
+of stale observations; switching back to the unchanged version restores them. A stale editor cannot
+overwrite newer observations. Manual authoring leaves existing guides and their provenance intact.
+Legacy `offline-doorway-annotations/1` floor-only guides (`landmarks: []`, `review_only: false`) remain
+supported. Guides marked review-only can be previewed but cannot be saved as connections.
+
+Connections move the source tracking group, including its companion rooms. Replacing an already
+placed group requires an explicit choice and a fresh combined preview. Saving changes only group
+placements, retains scan versions and unrelated placements, and checkpoints the original metadata
+under `connection-history/`. **Undo last saved connection** restores the exact prior metadata only
+when it would not overwrite newer edits. Each restored checkpoint is marked consumed, so repeated
+placements unwind in order; no-op saves add no undo step. An atomic pending-undo journal lets the
+next Undo finish an interrupted restore without taking an extra step. New connection saves wait
+for this recovery; intervening metadata edits are preserved and retire the interrupted undo.
+Checkpoint preimages remain on disk for recovery. A rescan in a fresh independent frame stays unplaced;
+its previous scan and group placement remain in history. Prepared group plans in
+`connection-review.json` also require exact metadata/layout bindings and a combined preview.
+
+For simulator validation, build Debug with a disposable `PRODUCT_BUNDLE_IDENTIFIER`, then launch
+with `-selftest`. Synthetic checks cover geometry rejection, floor matching, transformed sessions,
+manual opening save/hide/restore, stale edits, floor-guide preservation, placement undo and rescan
+history. No private fixture is required. To inspect a synthetic house's connection UI, use
+`-connection-house <house-id> -connection-source <room-id>`; add `-connection-openings` to inspect
+the editor. These entry points are Debug-only. Simulator checks do not verify live tracking or
+physical room alignment; review the combined model before saving a real connection.
+
 ## Sharing and importing
 
 Use the system share sheet to AirDrop exports or save them to Files. No Mac receiver or companion

@@ -90,11 +90,261 @@ final class SelfTest {
     expect(walls.count == 2, "room JSON walls parse for the doorway plan (\(walls.count)/2)")
   }
 
+  private func connectionLandmarks() throws {
+    var sourcePose = matrix_identity_float4x4; sourcePose.columns.3 = SIMD4(1,0.5,2,1)
+    var targetPose = matrix_identity_float4x4; targetPose.columns.3 = SIMD4(2,-2.25,3,1)
+    let source = RoomDoor(id: "s", width: 0.9, transform: sourcePose, height: 2.1)
+    let target = RoomDoor(id: "t", width: 0.92, transform: targetPose, height: 5.6)
+    let fit = ConnectionMath.floorAware(source: source, target: target, sourceFloor: -0.5, targetFloor: -1.25, flip: true)!
+    let point = fit * sourcePose.columns.3
+    expect(abs(fit.columns.3.y + 0.75) < 1e-5, "floor-aware placement ignores malformed doorway centre height")
+    expect(abs(point.x-2) < 1e-5 && abs(point.z-3) < 1e-5, "floor-aware placement preserves horizontal doorway correspondence")
+    expect(ConnectionMath.floorAware(source: source, target: target, sourceFloor: .nan, targetFloor: 0, flip: false) == nil, "invalid floor height is rejected")
+    var wide = target; wide = RoomDoor(id: "wide", width: 2, transform: targetPose, height: 2)
+    expect(ConnectionMath.floorAware(source: source, target: wide, sourceFloor: 0, targetFloor: 0, flip: false) == nil, "incompatible doorway widths cannot connect")
+    var scale = matrix_identity_float4x4; scale.columns.0.x = 1.01
+    expect(ConnectionMath.rigid(scale.columnMajor) == nil, "connection transform cannot scale geometry")
+    var reflection = matrix_identity_float4x4; reflection.columns.0.x = -1
+    expect(ConnectionMath.rigid(reflection.columnMajor) == nil, "connection transform cannot reflect geometry")
+    var h = try HouseProject.create(name: "Connection selftest")
+    defer { try? FileManager.default.removeItem(at: h.url) }
+    let zone = h.addZone(named: "test")
+    h.beginSession(id: "fixture", zone: zone.id, alignment: .init(method: "first"))
+    let ref = HouseProject.RoomRef(session: "fixture", index: 0, capturedAt: Date(timeIntervalSince1970: 1000))
+    let room = HouseProject.Room(id: "room", name: "Room", zone: zone.id, active: ref, history: [ref])
+    h.rooms = [room]; try h.save(); h = try HouseProject.load(id: h.id)
+    let raw = Data("{\"doors\":[],\"openings\":[]}".utf8)
+    let binding = ConnectionLandmarks.Binding(room_id: room.id, active_ref: ref, target_room_sha256: ConnectionMath.hash(raw))
+    let landmark = ConnectionLandmarks.Landmark(id: "manual", label: "Registered opening", room_id: room.id, active_ref: ref, target_room_sha256: ConnectionMath.hash(raw), width_m: 0.9, height_m: 2, transform: matrix_identity_float4x4.columnMajor)
+    let sidecar = ConnectionLandmarks(house_id: h.id, review_only: true, landmarks: [landmark], floorAnchors: [.init(binding: binding, height: -1.25, note: "Review only")])
+    let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+    let decoded = try ConnectionLandmarks.decode(encoder.encode(sidecar))
+    let doors = decoded.doors(room: room, data: raw, capturedIDs: [])
+    expect(doors.count == 1 && doors[0].reviewOnly, "registered opening is labelled and remains review-only")
+    expect(decoded.floor(room: room, data: raw)?.height == -1.25, "bound floor landmark is read")
+    expect(decoded.doors(room: room, data: raw + Data([32]), capturedIDs: []).isEmpty, "modified room geometry invalidates landmarks")
+    var switched = room; switched.active?.session = "different"
+    expect(decoded.doors(room: switched, data: raw, capturedIDs: []).isEmpty, "switching scan history invalidates landmarks")
+    expect(decoded.doors(room: room, data: raw, capturedIDs: ["manual"]).isEmpty, "annotation cannot shadow a captured doorway ID")
+    var duplicate = sidecar; duplicate.landmarks.append(landmark)
+    do { _ = try ConnectionLandmarks.decode(encoder.encode(duplicate)); expect(false, "duplicate landmark IDs rejected") }
+    catch { expect(true, "duplicate landmark IDs rejected") }
+    var metadata = try JSONSerialization.jsonObject(with: Data(contentsOf: h.url.appendingPathComponent("house.json"))) as! [String: Any]
+    metadata["futureMetadata"] = ["preserve": "yes"]
+    var rawZones = metadata["zones"] as! [[String: Any]]; rawZones[0]["futureZoneMetadata"] = "keep"; metadata["zones"] = rawZones
+    try JSONSerialization.data(withJSONObject: metadata, options: [.sortedKeys]).write(to: h.url.appendingPathComponent("house.json"))
+    let before = try Data(contentsOf: h.url.appendingPathComponent("house.json"))
+    var candidate = h; candidate.zones[0].toHouse[12] = 1
+    let roomPath = h.url.appendingPathComponent("sessions/fixture/rooms/room-0.json")
+    try FileManager.default.createDirectory(at: roomPath.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try raw.write(to: roomPath)
+    let prepared = PreparedConnectionPlan(houseID: h.id, baseHouseSHA256: ConnectionMath.hash(before), reviewOnly: true, note: "Synthetic group review", bindings: [binding], zones: [.init(id: zone.id, toHouse: candidate.zones[0].toHouse)])
+    expect(prepared.candidate(house: h) != nil && prepared.reviewOnly, "bound group plan previews without approval to save")
+    var missing = prepared; missing.bindings = []
+    expect(missing.candidate(house: h) == nil, "group plan requires every moved active room to be bound")
+    var unknown = prepared; unknown.zones[0].id = "unknown"
+    expect(unknown.candidate(house: h) == nil, "group plan cannot introduce a new tracking group")
+    try (raw + Data([32])).write(to: roomPath)
+    expect(prepared.candidate(house: h) == nil, "modified source geometry invalidates a prepared group fit")
+    try raw.write(to: roomPath)
+    try (before + Data([32])).write(to: h.url.appendingPathComponent("house.json"))
+    expect(prepared.candidate(house: h) == nil, "changed metadata invalidates a prepared group fit")
+    try before.write(to: h.url.appendingPathComponent("house.json"))
+    try ConnectionHistory.save(expected: h, candidate: candidate)
+    let saved = try HouseProject.load(id: h.id)
+    let savedJSON = try JSONSerialization.jsonObject(with: Data(contentsOf: h.url.appendingPathComponent("house.json"))) as! [String: Any]
+    expect((savedJSON["futureMetadata"] as? [String: String])?["preserve"] == "yes", "connection preserves unknown house metadata")
+    expect((savedJSON["zones"] as? [[String: Any]])?[0]["futureZoneMetadata"] as? String == "keep", "connection preserves unknown tracking-group metadata")
+    expect(try Data(contentsOf: roomPath) == raw, "connection save never modifies the captured room file")
+    expect(saved.rooms.count == h.rooms.count && saved.rooms[0].history == h.rooms[0].history && saved.rooms[0].active == h.rooms[0].active, "connection checkpoint preserves room history")
+    do { try ConnectionHistory.save(expected: h, candidate: candidate); expect(false, "stale connection save refused") }
+    catch { expect(true, "stale connection save refused") }
+    try ConnectionHistory.undo(house: saved)
+    expect(try Data(contentsOf: h.url.appendingPathComponent("house.json")) == before, "connection undo restores exact metadata bytes")
+    try ConnectionHistory.save(expected: h, candidate: candidate)
+    var edited = try HouseProject.load(id: h.id); edited.name = "New user edit"; try edited.save()
+    do { try ConnectionHistory.undo(house: edited); expect(false, "undo refuses newer user edits") }
+    catch { expect(true, "undo refuses newer user edits") }
+    expect(try HouseProject.load(id: h.id).name == "New user edit", "refused undo preserves new edits")
+    var malicious = edited; malicious.rooms.removeAll()
+    do { try ConnectionHistory.save(expected: edited, candidate: malicious); expect(false, "connection cannot remove rooms") }
+    catch { expect(true, "connection cannot remove rooms") }
+  }
+
+  private func connectionUndoRecovery() throws {
+    var h = try HouseProject.create(name: "Synthetic undo recovery")
+    defer { try? FileManager.default.removeItem(at: h.url) }
+    _ = h.addZone(named: "Group"); try h.save()
+    let path = h.url.appendingPathComponent("house.json")
+    let history = h.url.appendingPathComponent("connection-history")
+    let statePath = history.appendingPathComponent(ConnectionHistory.undoStateFilename)
+    let initialBytes = try Data(contentsOf: path)
+    func current() throws -> HouseProject { try HouseProject.load(id: h.id) }
+    func saveX(_ x: Float) throws {
+      let before = try current(); var after = before; after.zones[0].toHouse[12] = x
+      try ConnectionHistory.save(expected: before, candidate: after)
+    }
+    func state() throws -> ConnectionHistory.UndoState {
+      guard FileManager.default.fileExists(atPath: statePath.path) else { return .init() }
+      return try JSONDecoder().decode(ConnectionHistory.UndoState.self, from: Data(contentsOf: statePath))
+    }
+    func checkpointFiles() throws -> [URL] {
+      try FileManager.default.contentsOfDirectory(at: history, includingPropertiesForKeys: nil)
+        .filter { $0.pathExtension == "json" && $0.lastPathComponent != ConnectionHistory.undoStateFilename }
+    }
+    // Reconstruct the durable journal at the two possible interruption points, without
+    // terminating the selftest process or adding fault injection to production APIs.
+    func interruptUndo(afterRestore: Bool) throws -> String {
+      let bytes = try Data(contentsOf: path); var journal = try state()
+      let pending = try checkpointFiles().compactMap { file -> ConnectionHistory.PendingUndo? in
+        let cp = try JSONDecoder().decode(ConnectionHistory.Checkpoint.self, from: Data(contentsOf: file))
+        guard !journal.consumed.contains(file.lastPathComponent), cp.afterHash == ConnectionMath.hash(bytes), cp.before != bytes else { return nil }
+        return .init(checkpointID: file.lastPathComponent, checkpoint: cp)
+      }.sorted { $0.checkpoint.createdAt > $1.checkpoint.createdAt }.first!
+      journal.pending = pending
+      try JSONEncoder().encode(journal).write(to: statePath, options: .atomic)
+      if afterRestore { try pending.checkpoint.before.write(to: path, options: .atomic) }
+      return pending.checkpointID
+    }
+    try saveX(1); try saveX(2); try saveX(1)
+    let beforeNoOp = try Data(contentsOf: path), count = try checkpointFiles().count
+    try saveX(1)
+    expect(try Data(contentsOf: path) == beforeNoOp && checkpointFiles().count == count, "no-op connection save preserves metadata bytes and adds no undo step")
+    for x: Float in [2,1,0] {
+      try ConnectionHistory.undo(house: current())
+      expect(try current().zones[0].toHouse[12] == x, "repeated placement undo advances to prior state \(x) without cycling")
+    }
+    expect(try Data(contentsOf: path) == initialBytes && state().consumed.count == 3, "complete undo restores original bytes and consumes each checkpoint once")
+    do { try ConnectionHistory.undo(house: current()); expect(false, "exhausted undo cannot resurrect consumed placements") }
+    catch { expect(true, "exhausted undo cannot resurrect consumed placements") }
+    expect(try checkpointFiles().count == 3, "consumed checkpoint preimages remain available for recovery")
+    try saveX(1)
+    let bytes = try Data(contentsOf: path)
+    let legacy = ConnectionHistory.Checkpoint(before: bytes, afterHash: ConnectionMath.hash(bytes), createdAt: Date().addingTimeInterval(1000))
+    try JSONEncoder().encode(legacy).write(to: history.appendingPathComponent("legacy-noop.json"))
+    try ConnectionHistory.undo(house: current())
+    expect(try current().zones[0].toHouse[12] == 0, "legacy no-op checkpoint cannot shadow earlier undo")
+    try saveX(1)
+    let pendingBefore = try interruptUndo(afterRestore: false)
+    do { try saveX(2); expect(false, "new save waits for interrupted undo recovery") }
+    catch ConnectionMath.Failure.pendingUndo { expect(true, "new save waits for interrupted undo recovery") }
+    try ConnectionHistory.undo(house: current())
+    expect(try current().zones[0].toHouse[12] == 0 && state().pending == nil && state().consumed.contains(pendingBefore), "interruption before restore retries the undo and consumes it")
+    try saveX(1); try saveX(2)
+    let pendingAfter = try interruptUndo(afterRestore: true)
+    let restoredBytes = try Data(contentsOf: path)
+    try ConnectionHistory.undo(house: current())
+    expect(try Data(contentsOf: path) == restoredBytes && state().pending == nil && state().consumed.contains(pendingAfter), "interruption after restore completes consumption without undoing an extra step")
+    try ConnectionHistory.undo(house: current())
+    expect(try current().zones[0].toHouse[12] == 0, "earlier undo remains available after crash recovery")
+    try saveX(1)
+    let abandoned = try interruptUndo(afterRestore: false)
+    var edited = try current(); edited.name = "Newer user edit"; try edited.save()
+    let editedBytes = try Data(contentsOf: path)
+    do { try ConnectionHistory.undo(house: edited); expect(false, "interrupted undo refuses intervening edits") }
+    catch ConnectionMath.Failure.stale { expect(true, "interrupted undo refuses intervening edits") }
+    expect(try Data(contentsOf: path) == editedBytes && state().pending == nil && state().consumed.contains(abandoned), "newer metadata survives and interrupted checkpoint is retired")
+    try saveX(2)
+    try ConnectionHistory.undo(house: current())
+    expect(try Data(contentsOf: path) == editedBytes, "new connections and undo remain usable after retiring stale recovery")
+  }
+
+  private func manualOpeningsAndPlacement() throws {
+    var h = try HouseProject.create(name: "Synthetic connection checks")
+    defer { try? FileManager.default.removeItem(at: h.url) }
+    let referenceZone = h.addZone(named: "Reference"), sourceZone = h.addZone(named: "Separate capture")
+    h.beginSession(id: "reference", zone: referenceZone.id, alignment: .init(method: "first"))
+    h.beginSession(id: "source", zone: sourceZone.id, alignment: .init(method: "first"))
+    let date = Date(timeIntervalSince1970: 1000)
+    let target = h.recordRoomScan(name: "Reference", session: "reference", index: 0, capturedAt: date)!
+    let source = h.recordRoomScan(name: "Source", session: "source", index: 0, capturedAt: date)!
+    _ = h.recordRoomScan(name: "Companion", session: "source", index: 1, capturedAt: date)
+    h.zones[0].toHouse[12] = 5
+    var rotated = simd_float4x4(simd_quatf(angle: .pi/2, axis: SIMD3(0,1,0)))
+    rotated.columns.3 = SIMD4(2,0,3,1); h.sessions[1].alignment.toZone = rotated.columnMajor
+    try h.save(); h = try HouseProject.load(id: h.id)
+    var wallPose = matrix_identity_float4x4; wallPose.columns.3 = SIMD4(1,1.5,2,1)
+    let raw = try JSONSerialization.data(withJSONObject: ["walls": [["identifier": "wall", "dimensions": [4,3,0], "transform": wallPose.columnMajor]], "doors": [], "openings": []])
+    let path = h.bundle(for: h.session("source")!).file("rooms/room-0.json")
+    try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true); try raw.write(to: path)
+    let wall = OpeningWall.parse(try JSONSerialization.jsonObject(with: raw) as! [String: Any])[0]
+    let pose = wall.opening(width: 0.9, height: 2.1, offset: 0.6, floor: 0)!
+    expect(abs(pose.columns.3.x-1.6) < 1e-5 && abs(pose.columns.3.y-1.05) < 1e-5, "manual opening follows the measured wall and its floor edge")
+    expect(wall.opening(width: 0.9, height: 2.1, offset: 2, floor: 0) == nil, "manual opening cannot extend beyond the wall")
+    expect(wall.opening(width: 0.9, height: 3.4, offset: 0, floor: 0) == nil, "manual opening cannot exceed wall height")
+    expect(wall.opening(width: .nan, height: 2.1, offset: 0, floor: 0) == nil, "manual opening rejects nonfinite dimensions")
+    let housePath = h.url.appendingPathComponent("house.json"), metadata = try Data(contentsOf: h.url.appendingPathComponent("house.json"))
+    let binding = ConnectionLandmarks.Binding(room_id: source.id, active_ref: source.active!, target_room_sha256: ConnectionMath.hash(raw))
+    let guide = ConnectionLandmarks(house_id: h.id, review_only: false, landmarks: [], floorAnchors: [.init(binding: binding, height: 0, note: "Synthetic guide")])
+    let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+    let guideBytes = try encoder.encode(guide), guidePath = h.url.appendingPathComponent(ConnectionLandmarks.filename)
+    try guideBytes.write(to: guidePath)
+    let initial = try ManualOpenings.load(house: h)
+    var added = initial
+    added.entries.append(.init(id: "manual-test", binding: binding, wallID: wall.id, label: "Measured doorway", width: 0.9, height: 2.1, transform: pose.columnMajor))
+    try ManualOpenings.save(expected: initial, candidate: added, house: h, room: source, roomData: raw)
+    let saved = try ManualOpenings.load(house: h)
+    expect(saved.entries.count == 1 && RoomDoor.load(house: h, room: source).first?.manuallyAdded == true, "manual opening appears in the connection picker")
+    expect(try Data(contentsOf: path) == raw && Data(contentsOf: housePath) == metadata, "authoring preserves captured geometry and scan history bytes")
+    expect(try Data(contentsOf: guidePath) == guideBytes && ConnectionLandmarks.load(house: h)?.floor(room: source, data: raw)?.height == 0, "manual authoring preserves legacy floor-only guides byte for byte")
+    do { try ManualOpenings.save(expected: initial, candidate: added, house: h, room: source, roomData: raw); expect(false, "stale editor cannot overwrite newer openings") }
+    catch { expect(true, "stale editor cannot overwrite newer openings") }
+    var hidden = saved; hidden.entries[0].hidden = true
+    try ManualOpenings.save(expected: saved, candidate: hidden, house: h, room: source, roomData: raw)
+    let hiddenSaved = try ManualOpenings.load(house: h)
+    expect(RoomDoor.load(house: h, room: source).isEmpty && hiddenSaved.entries.count == 1, "hiding preserves the observation and removes its connection marker")
+    try ManualOpenings.save(expected: hidden, candidate: saved, house: h, room: source, roomData: raw)
+    expect(RoomDoor.load(house: h, room: source).count == 1, "hidden opening can be restored")
+    var moved = saved; moved.entries[0].transform[12] += 10
+    do { try ManualOpenings.save(expected: saved, candidate: moved, house: h, room: source, roomData: raw); expect(false, "prior manual measurement cannot be silently replaced") }
+    catch { expect(true, "prior manual measurement cannot be silently replaced") }
+    try (raw + Data([32])).write(to: path)
+    expect(RoomDoor.load(house: h, room: source).isEmpty, "changed layout invalidates manual observations")
+    do { try ManualOpenings.save(expected: saved, candidate: hidden, house: h, room: source, roomData: raw); expect(false, "stale scan editor cannot save") }
+    catch { expect(true, "stale scan editor cannot save") }
+    try raw.write(to: path)
+    let sourceDoor = saved.entries[0].door!
+    var targetPose = matrix_identity_float4x4; targetPose.columns.3 = SIMD4(0,1.05,0,1)
+    let targetDoor = RoomDoor(id: "target", width: 0.92, transform: targetPose, height: 2.1)
+    let tallDoor = RoomDoor(id: "tall", width: 0.92, transform: targetPose, height: 5)
+    expect(ConnectionMath.placement(house: h, source: source, target: target, sourceDoor: sourceDoor, targetDoor: tallDoor, flip: true) == nil, "tall doorway cannot use centre matching")
+    let matched = ConnectionMath.placement(house: h, source: source, target: target, sourceDoor: sourceDoor, targetDoor: tallDoor, flip: true, floors: (0, 0))!
+    let placedPoint = matched.toHouse(matched.session("source")!) * sourceDoor.transform.columns.3
+    let targetPoint = h.toHouse(h.session("reference")!) * tallDoor.transform.columns.3
+    expect(simd_length(placedPoint-targetPoint) < 1e-4, "floor match composes rotated session and saved reference placement")
+    expect(matched.zones[0].toHouse == h.zones[0].toHouse && matched.rooms.map(\.history) == h.rooms.map(\.history), "matching preserves reference placement and all scan histories")
+    expect(matched.rooms.first { $0.name == "Companion" }?.zone == sourceZone.id, "shared-frame companion stays in the moving group")
+    var invalid = h; invalid.sessions[1].alignment.toZone = [1]
+    expect(ConnectionMath.placement(house: invalid, source: source, target: target, sourceDoor: sourceDoor, targetDoor: targetDoor, flip: true) == nil, "malformed persisted matrix is rejected without crashing")
+    invalid = h; invalid.zones[0].toHouse[0] = 2
+    expect(ConnectionMath.placement(house: invalid, source: source, target: target, sourceDoor: sourceDoor, targetDoor: targetDoor, flip: true) == nil, "scaled reference placement is rejected")
+    let huge = RoomDoor(id: "huge", width: 8, transform: targetPose, height: 2)
+    expect(ConnectionMath.floorAware(source: huge, target: huge, sourceFloor: 0, targetFloor: 0, flip: false) == nil, "floor matching rejects implausible widths")
+    let floorJSON: [String: Any] = ["floors": [["transform": matrix_identity_float4x4.columnMajor]]]
+    expect(ConnectionMath.inferredFloor(door: targetDoor, json: floorJSON) == 0 && ConnectionMath.inferredFloor(door: tallDoor, json: floorJSON) == nil, "floor inference requires a plausible doorway bottom")
+    try ConnectionHistory.save(expected: h, candidate: matched)
+    var rescanned = try HouseProject.load(id: h.id)
+    let fresh = rescanned.addZone(named: "New capture")
+    rescanned.beginSession(id: "rescan", zone: fresh.id, alignment: .init(method: "first"))
+    _ = rescanned.recordRoomScan(name: source.name, session: "rescan", index: 0, capturedAt: date.addingTimeInterval(1), roomID: source.id)
+    try rescanned.save()
+    let active = rescanned.rooms.first { $0.id == source.id }!
+    expect(rescanned.zone(fresh.id)?.aligned == false && rescanned.zone(sourceZone.id)?.toHouse == matched.zone(sourceZone.id)?.toHouse, "independent rescan stays unplaced and preserves the old group placement")
+    expect(active.history.count == 2 && saved.entries(room: active, data: raw).isEmpty, "independent rescan keeps history without borrowing old manual markers")
+    do { try ConnectionHistory.undo(house: rescanned); expect(false, "placement undo cannot erase a newer scan") }
+    catch { expect(true, "placement undo cannot erase a newer scan") }
+    rescanned.setActive(room: source.id, source.active!)
+    expect(saved.entries(room: rescanned.rooms.first { $0.id == source.id }!, data: raw).count == 1, "switching back restores that version's observations")
+  }
+
   func run() async -> Bool {
     var houseID: String?
     do {
       try await coveragePerformance()
       try roomJSONParsing()
+      try connectionLandmarks()
+      try manualOpeningsAndPlacement()
+      try connectionUndoRecovery()
       trackingRecovery()
       try roomExperience()
       try captureDiagnostics()
